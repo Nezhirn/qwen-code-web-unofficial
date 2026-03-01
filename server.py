@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+"""
+Qwen Agent — FastAPI + WebSocket + Qwen CLI + MCP
+Веб-интерфейс для qwen-cli с поддержкой MCP инструментов.
+
+Фичи:
+  - Стриминг ответов с отображением thinking
+  - Множественные сессии чатов (SQLite)
+  - MCP инструменты (bash, ssh, web, memory)
+  - Tool calling loop
+  - Подтверждение bash/ssh команд перед выполнением
+  - Остановка генерации по запросу пользователя
+"""
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
+import asyncio
+import json
+import logging
+import os
+import select
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+# ─── Конфигурация ───────────────────────────────────────────────
+
+import logging
+import sys
+
+# Настройка логирования ДО всех импортов которые используют logger
+log_handler = logging.FileHandler(Path(__file__).parent / "server.log")
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+log_handler.setLevel(logging.INFO)
+
+logger = logging.getLogger(__name__)
+logger.addHandler(log_handler)
+logger.setLevel(logging.INFO)
+
+# ─── Конфигурация ───────────────────────────────────────────────
+
+DB_PATH = str(Path(__file__).parent / "sessions.db")
+MCP_SERVER_SCRIPT = str(Path(__file__).parent / "mcp_tools_server.py")
+
+
+
+
+# Хранилище фоновых задач
+background_tasks: dict = {}
+
+# Инструменты требующие подтверждения
+TOOLS_REQUIRING_CONFIRMATION = {
+    "Bash", "bash", "run_bash_command", "execute_command",
+    "run_command", "shell", "run_shell_command",
+    "ssh", "SSH", "run_ssh_command", "remote_command",
+    "Write", "write_file", "create_file",
+    "Edit", "edit_file", "replace_in_file",
+}
+
+# Лимиты безопасности
+MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+class RequestSizeLimitMiddleware:
+    """ASGI middleware для ограничения размера тела запроса. Совместим с WebSocket."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            content_length = headers.get(b"content-length")
+            if content_length and int(content_length) > MAX_REQUEST_SIZE:
+                response = JSONResponse({"error": "Запрос слишком большой"}, status_code=413)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+class SecurityHeadersMiddleware:
+    """ASGI middleware для добавления security headers. Совместим с WebSocket."""
+    HEADERS = [
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"x-xss-protection", b"1; mode=block"),
+        (b"referrer-policy", b"strict-origin-when-cross-origin"),
+    ]
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.extend(self.HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+SYSTEM_PROMPT = """Ты — Qwen Agent, автономный AI-ассистент для работы на Linux-сервере.
+Твоя задача — эффективно решать задачи пользователя, используя доступные инструменты.
+
+═══ ТВОЯ СРЕДА ═══
+• ОС: Linux (Fedora-based)
+• Хостнейм: qwen-agent
+• Python: 3.14.3
+• Ты работаешь на выделенном сервере, посвящённом тебе и твоему сервису.
+• Домашняя директория пользователя: /home/andrew
+• Рабочая директория сервиса: /home/andrew/qwen-agent
+
+═══ ИНСТРУМЕНТЫ ═══
+
+🔹 ТЫ ИСПОЛЬЗУЕШЬ ВСЕ ИНСТРУМЕНТЫ НАТИВНО (через qwen-code):
+
+   run_shell_command(command: str) — bash команды
+   read_file(absolute_path: str) — чтение файлов
+   write_file(path: str, content: str) — запись файлов
+   edit_file(path: str, old_string: str, new_string: str) — редактирование файлов
+   list_directory(path: str) — список файлов в директории
+   glob(pattern: str, path: str) — поиск файлов по шаблону
+   grep_search(pattern: str, path: str) — поиск по содержимому файлов
+   web_fetch(url: str) — загрузка веб-страницы
+   web_search(query: str) — поиск в интернете
+   todo_write(todos: list) — управление задачами
+   todo_read() — чтение списка задач
+   save_memory(fact: str, scope: str) — сохранение в память
+   read_memory() — чтение памяти
+
+═══ КОНТЕКСТ И ПАМЯТЬ ═══
+• История чата доступна полностью — читай сообщения, а не read_memory.
+• read_memory возвращает ТОЛЬКО сохранённое через save_memory.
+• Сохраняй важные факты: IP, домены, пути, имена, настройки, предпочтения.
+• Память сохраняется между сессиями одного чата.
+
+═══ ПРИНЦИПЫ РАБОТЫ ═══
+
+1. 🚀 ДЕЙСТВУЙ, НЕ РАССУЖДАЙ
+   • Вместо «я могу выполнить команду» — сразу вызывай инструмент.
+   • Вместо «вам нужно сделать X» — сделай X.
+
+2. 📋 РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ
+   • Декомпозируй на последовательные шаги.
+   • Выполняй шаг за шагом, используя результаты предыдущих.
+
+3. 🎯 МИНИМУМ ТЕКСТА, МАКСИМУМ ДЕЛА
+   • Вызывай инструменты без лишних объяснений.
+   • Кратко комментируй только ключевые шаги.
+
+4. 🧠 ЗАПОМИНАЙ ВАЖНОЕ
+   • Узнал IP/домен/путь/конфиг → save_memory.
+   • Пользователь назвал предпочтения → save_memory.
+
+5. ✅ ПРОВЕРЯЙ РЕЗУЛЬТАТЫ
+   • После команды проверяй вывод на ошибки.
+   • Если ошибка — анализируй и исправляй.
+
+6. 🔒 БЕЗОПАСНОСТЬ
+   • Не выполняй деструктивные действия без явного запроса.
+
+═══ ПРИМЕРЫ ═══
+
+❌ ПЛОХО: «Я могу проверить содержимое директории командой ls»
+✅ ХОРОШО: [вызов list_directory(path="/home/andrew/qwen-agent")]
+
+❌ ПЛОХО: «Вам нужно установить пакет через pip»
+✅ ХОРОШО: [вызов run_bash_command("pip install package-name")]
+
+❌ ПЛОХО: «Где находится проект? Я не вижу пути»
+✅ ХОРОШО: [вызов list_directory()] или [read_memory()]
+
+═══ СЕРВИС QWEN-AGENT ═══
+Ты работаешь в сервисе qwen-agent — веб-интерфейсе для qwen-cli.
+• Сервер: FastAPI на порту 10310
+• Фронтенд: React + TypeScript + Vite в /home/andrew/qwen-agent/static/
+• MCP-сервер: /home/andrew/qwen-agent/mcp_tools_server.py
+• База данных: SQLite /home/andrew/qwen-agent/sessions.db
+• Логи: /home/andrew/qwen-agent/server.log
+
+Ты — хозяин этой машины. Используй все инструменты для эффективной работы."""
+
+# ─── База данных ────────────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            system_prompt TEXT DEFAULT NULL
+        )
+    """)
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            thinking TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, key)
+        )
+    """)
+    # Индексы для производительности
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_session_id ON memory(session_id)")
+    conn.commit()
+    conn.close()
+
+
+def get_db() -> sqlite3.Connection:
+    """Создаёт соединение SQLite с правильными настройками."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def get_sessions(user_id: Optional[str] = None):
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    if user_id:
+        rows = conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? OR user_id IS NULL ORDER BY updated_at DESC",
+            (user_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_session(title="Новый чат", user_id: Optional[str] = None):
+    sid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (sid, user_id, title, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"id": sid, "title": title, "created_at": now, "updated_at": now, "user_id": user_id}
+
+
+def rename_session(sid: str, title: str):
+    conn = get_db()
+    conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
+    conn.commit()
+    conn.close()
+
+
+def delete_session(sid: str):
+    conn = get_db()
+    conn.execute("DELETE FROM memory WHERE session_id = ?", (sid,))
+    conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+    conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+
+
+def get_messages(session_id: str):
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_message(session_id, role, content, thinking=None, tool_calls=None, tool_name=None):
+    now = datetime.now().isoformat()
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO messages (session_id, role, content, thinking, tool_calls, tool_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, role, content, thinking,
+         json.dumps(tool_calls) if tool_calls else None,
+         tool_name, now),
+    )
+    conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
+    conn.commit()
+    conn.close()
+
+
+def get_session_prompt(session_id: str) -> Optional[str]:
+    conn = get_db()
+    row = conn.execute("SELECT system_prompt FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def set_session_prompt(session_id: str, prompt: Optional[str]):
+    conn = get_db()
+    conn.execute(
+        "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+        (prompt if prompt and prompt.strip() else None, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def read_memory_for_session(session_id: str) -> list:
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT key, value FROM memory WHERE session_id = ? ORDER BY id ASC",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [{"key": r["key"], "value": r["value"]} for r in rows]
+
+
+def save_memory_for_session(session_id: str, key: str, value: str):
+    now = datetime.now().isoformat()
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO memory (session_id, key, value, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value, created_at = excluded.created_at""",
+        (session_id, key, value, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def auto_title(session_id: str, user_msg: str):
+    title = user_msg[:50].strip()
+    if len(user_msg) > 50:
+        title += "..."
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+    ).fetchone()[0]
+    if count == 0:
+        conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+        conn.commit()
+    conn.close()
+    return title if count == 0 else None
+
+
+# ─── MCP ────────────────────────────────────────────────────────
+
+MCP_PYTHON = os.getenv("MCP_PYTHON", sys.executable)
+
+
+class MCPSessionManager:
+    """Менеджер единственной MCP-сессии. Не привязан к session_id чата."""
+    def __init__(self):
+        self._session = None
+        self._cm_stdio = None
+        self._cm_client = None
+        self._lock = asyncio.Lock()
+        self._connected = False
+
+    async def _create_session(self):
+        """Создаёт новую MCP-сессию. Вызывать ТОЛЬКО под self._lock."""
+        await self._close_internal()
+
+        env = {**os.environ}
+        params = StdioServerParameters(
+            command=MCP_PYTHON,
+            args=[MCP_SERVER_SCRIPT],
+            cwd=str(Path(__file__).parent),
+            env=env,
+        )
+        self._cm_stdio = stdio_client(params)
+        read, write = await self._cm_stdio.__aenter__()
+
+        self._cm_client = ClientSession(read, write)
+        self._session = await self._cm_client.__aenter__()
+        await self._session.initialize()
+        self._connected = True
+
+    async def _close_internal(self):
+        """Закрывает ресурсы. Вызывать ТОЛЬКО под self._lock."""
+        if self._cm_client:
+            try:
+                await self._cm_client.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._cm_client = None
+        if self._cm_stdio:
+            try:
+                await self._cm_stdio.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._cm_stdio = None
+        self._session = None
+        self._connected = False
+
+    async def _ensure_session(self):
+        """Гарантирует наличие живой сессии. Вызывать ТОЛЬКО под self._lock."""
+        if self._session and self._connected:
+            return self._session
+        await self._create_session()
+        return self._session
+
+    async def call_tool(self, name: str, arguments: dict):
+        async with self._lock:
+            try:
+                session = await self._ensure_session()
+                result = await session.call_tool(name, arguments=arguments)
+                return result
+            except asyncio.CancelledError:
+                # CancelledError — НЕ маркируем сессию как сломанную
+                raise
+            except Exception:
+                # Реальная ошибка MCP — пересоздадим сессию при следующем вызове
+                self._connected = False
+                self._session = None
+                raise
+
+    async def list_tools(self):
+        async with self._lock:
+            session = await self._ensure_session()
+            tools_list = await session.list_tools()
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.inputSchema,
+                    },
+                }
+                for t in tools_list.tools
+            ]
+
+    async def close(self):
+        async with self._lock:
+            await self._close_internal()
+
+
+mcp_manager = MCPSessionManager()
+
+
+async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "") -> str:
+    # Для memory-инструментов передаём session_id как аргумент
+    if tool_name in ("save_memory", "read_memory", "delete_memory") and session_id:
+        arguments = {**arguments, "session_id": session_id}
+    result = await mcp_manager.call_tool(tool_name, arguments)
+    return getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
+
+
+# Кэш для списка инструментов (не меняется в runtime)
+_tools_cache: list = []
+
+async def get_mcp_tools() -> list:
+    global _tools_cache
+    if _tools_cache:
+        return _tools_cache
+    _tools_cache = await mcp_manager.list_tools()
+    return _tools_cache
+
+
+# ─── Qwen CLI SDK mode ──────────────────────────────────────────
+
+def run_qwen_cli_sdk(session_id: str = None, resume_id: str = None):
+    """
+    Запускает qwen cli в SDK mode.
+    --session-id для первого сообщения (создаёт сессию).
+    --resume <uuid> для последующих (загружает историю).
+    """
+    qwen_path = os.getenv("QWEN_PATH", "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen")
+    cmd = [
+        qwen_path,
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--approval-mode", "default",
+    ]
+    if resume_id:
+        # --resume <uuid> загружает существующую сессию
+        cmd.extend(["--resume", resume_id])
+    elif session_id:
+        # --session-id <uuid> создаёт новую сессию с данным ID
+        cmd.extend(["--session-id", session_id])
+
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        preexec_fn=os.setsid,
+    )
+
+
+# ─── Утилиты ────────────────────────────────────────────────────
+
+
+def _auto_save_digest(session_id: str, last_user_msg: str):
+    try:
+        DIGEST_KEY = "_auto_conversation_topics"
+        MAX_TOPICS = 20
+        mem_entries = read_memory_for_session(session_id)
+        existing = ""
+        for e in mem_entries:
+            if e["key"] == DIGEST_KEY:
+                existing = e["value"]
+                break
+        topics = [t.strip() for t in existing.split("|") if t.strip()] if existing else []
+        new_topic = last_user_msg[:100].strip()
+        if new_topic:
+            topics.append(new_topic)
+        if len(topics) > MAX_TOPICS:
+            topics = topics[-MAX_TOPICS:]
+        save_memory_for_session(session_id, DIGEST_KEY, " | ".join(topics))
+    except Exception:
+        pass
+
+
+async def _safe_send(ws: WebSocket, data: dict):
+    try:
+        await ws.send_json(data)
+    except Exception:
+        pass
+
+
+async def _wait_for_confirmation(
+    confirm_queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+    timeout: float = 300,
+) -> str:
+    """Ждёт подтверждения от пользователя через confirm_queue."""
+    if stop_event.is_set():
+        return "stop"
+    queue_task = asyncio.create_task(confirm_queue.get())
+    stop_task = asyncio.create_task(stop_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {queue_task, stop_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        queue_task.cancel()
+        stop_task.cancel()
+        return "stop"
+    for p in pending:
+        p.cancel()
+    if stop_task in done or stop_event.is_set():
+        return "stop"
+    if queue_task in done:
+        data = queue_task.result()
+        if data is None:
+            return "stop"
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            return data.get("action", "deny")
+    return "deny"
+
+
+async def _wait_for_init_response(proc, timeout=10):
+    """Ждёт control_response на initialize от qwen."""
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            line = await asyncio.wait_for(_async_readline(proc), timeout=5)
+        except asyncio.TimeoutError:
+            continue
+        if not line:
+            continue
+        try:
+            data = json.loads(line.strip())
+            if data.get("type") == "control_response":
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def build_history(messages: list, session_id: str = "", custom_prompt: str = None) -> list:
+    effective_prompt = custom_prompt or SYSTEM_PROMPT
+    system_msg = {"role": "system", "content": effective_prompt}
+
+    all_msgs = []
+    for m in messages:
+        if m["role"] in ("user", "assistant"):
+            all_msgs.append({"role": m["role"], "content": m["content"]})
+        elif m["role"] == "tool":
+            all_msgs.append({"role": "tool", "content": m["content"]})
+        elif m["role"] == "assistant_tool_call":
+            tc = json.loads(m["tool_calls"]) if m["tool_calls"] else []
+            entry = {"role": "assistant", "content": m["content"] or ""}
+            if tc:
+                entry["tool_calls"] = tc
+            all_msgs.append(entry)
+
+    memory_injection = ""
+    if session_id:
+        mem_entries = read_memory_for_session(session_id)
+        user_entries = [e for e in mem_entries if not e["key"].startswith("_auto_")]
+        if user_entries:
+            mem_lines = [f"  • {e['key']}: {e['value']}" for e in user_entries]
+            memory_injection = "Сохранённые факты (долгосрочная память):\n" + "\n".join(mem_lines)
+
+    history = [system_msg]
+    if memory_injection:
+        history.append({"role": "system", "content": memory_injection})
+    history += all_msgs
+    return history
+
+
+async def _async_readline(proc) -> str:
+    """Читает строку из stdout процесса без блокировки event loop.
+    Корректно обрабатывает таймауты — не оставляет заблокированные threads."""
+    loop = asyncio.get_event_loop()
+    
+    def _readline_with_poll():
+        """Читает строку, но сначала проверяет что данные доступны."""
+        fd = proc.stdout.fileno()
+        # Ждём данные до 1 секунды за раз
+        ready, _, _ = select.select([fd], [], [], 1.0)
+        if ready:
+            return proc.stdout.readline()
+        return ""  # Нет данных — вернём пустую строку, вызывающий повторит
+    
+    return await loop.run_in_executor(None, _readline_with_poll)
+
+
+def _kill_proc(proc):
+    """Безопасно завершает процесс через process group."""
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # Убиваем всю группу
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+
+async def stream_chat_background(
+    session_id: str,
+    user_message: str,
+    connection_state: dict,
+    stop_event: asyncio.Event,
+    confirm_queue: asyncio.Queue,
+    ws: WebSocket,
+):
+    """
+    Обрабатывает запрос пользователя.
+    qwen-code работает в --approval-mode default.
+    Для опасных инструментов (bash/ssh/write/edit) показываем confirm_request.
+    """
+    logger.info(f"Начало обработки: {session_id}, сообщение: {user_message[:50]}...")
+
+    new_title = auto_title(session_id, user_message)
+    if new_title:
+        await _safe_send(ws, {"type": "session_renamed", "id": session_id, "title": new_title})
+
+    save_message(session_id, "user", user_message)
+    _auto_save_digest(session_id, user_message)
+
+    await _safe_send(ws, {"type": "response_start"})
+    await _safe_send(ws, {"type": "stream_start"})
+
+    db_messages = get_messages(session_id)
+    custom_prompt = get_session_prompt(session_id)
+    history = build_history(db_messages, session_id=session_id, custom_prompt=custom_prompt)
+
+    thinking_buffer = ""
+    content_buffer = ""
+    tool_calls_log = []
+    tool_results_log = []  # Копим tool результаты для сохранения в правильном порядке
+    pending_tool_calls = {}  # tool_use_id -> tool_info
+
+    proc = None
+    try:
+        # Если в БД есть предыдущие сообщения (не только текущее) — resume
+        has_history = len(db_messages) > 1
+        
+        # Проверяем что session_id — полный UUID (36 символов)
+        is_valid_uuid = len(session_id) == 36 and session_id.count('-') == 4
+
+        # SDK mode: инициализация и отправка через stdin
+        if has_history and is_valid_uuid:
+            proc = run_qwen_cli_sdk(resume_id=session_id)
+        elif is_valid_uuid:
+            proc = run_qwen_cli_sdk(session_id=session_id)
+        else:
+            # Старая сессия с коротким ID — без контекста qwen
+            proc = run_qwen_cli_sdk()
+
+        # 1. Инициализируем SDK mode
+        init_msg = json.dumps({
+            "type": "control_request",
+            "request_id": "init-001",
+            "request": {"subtype": "initialize"}
+        })
+        proc.stdin.write(init_msg + "\n")
+        proc.stdin.flush()
+
+        # Ждём control_response для initialize
+        init_resp = await _wait_for_init_response(proc)
+
+        # Fallback: если процесс умер (например --resume на несуществующей сессии)
+        if init_resp is None and proc.poll() is not None:
+            logger.warning(f"qwen процесс завершился, пробуем без --resume (session_id={session_id})")
+            proc = run_qwen_cli_sdk(session_id=session_id)
+            proc.stdin.write(init_msg + "\n")
+            proc.stdin.flush()
+            await _wait_for_init_response(proc)
+
+        # 2. Отправляем сообщение пользователя
+        user_msg = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": user_message}
+        })
+        proc.stdin.write(user_msg + "\n")
+        proc.stdin.flush()
+
+        # 3. Читаем поток
+        done = False
+        while not done:
+            if stop_event.is_set():
+                _kill_proc(proc)
+                await _safe_send(ws, {"type": "stopped"})
+                break
+
+            # Проверяем завершение процесса
+            if proc.poll() is not None:
+                # Читаем остаток stdout
+                remaining = proc.stdout.read()
+                if remaining:
+                    for line in remaining.splitlines():
+                        thinking_buffer, content_buffer, done = await _process_line(
+                            ws, line, proc, thinking_buffer, content_buffer, tool_calls_log,
+                            pending_tool_calls, connection_state, confirm_queue,
+                            stop_event, session_id, tool_results_log
+                        )
+                        if done:
+                            break
+                break
+
+            try:
+                line = await asyncio.wait_for(_async_readline(proc), timeout=180)
+            except asyncio.TimeoutError:
+                _kill_proc(proc)
+                await _safe_send(ws, {"type": "error", "content": "Таймаут ожидания ответа qwen"})
+                break
+
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            thinking_buffer, content_buffer, done = await _process_line(
+                ws, line, proc, thinking_buffer, content_buffer, tool_calls_log,
+                pending_tool_calls, connection_state, confirm_queue,
+                stop_event, session_id, tool_results_log
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка: {e}", exc_info=True)
+        await _safe_send(ws, {"type": "error", "content": str(e)})
+    finally:
+        if proc and proc.poll() is None:
+            _kill_proc(proc)
+
+    # Сохраняем в БД в правильном порядке: assistant_tool_call → tool × N
+    if content_buffer or thinking_buffer or tool_calls_log:
+        if tool_calls_log:
+            # Сначала assistant_tool_call
+            save_message(session_id, "assistant_tool_call",
+                        content_buffer, thinking=thinking_buffer,
+                        tool_calls=tool_calls_log)
+            # Затем tool результаты
+            for tr in tool_results_log:
+                save_message(session_id, "tool", tr["content"], tool_name=tr["tool_name"])
+        else:
+            save_message(session_id, "assistant", content_buffer, thinking=thinking_buffer)
+
+    await _safe_send(ws, {"type": "stream_end"})
+    await _safe_send(ws, {"type": "response_end"})
+
+
+async def _process_line(
+    ws: WebSocket,
+    line: str,
+    proc,
+    thinking_buffer: str,
+    content_buffer: str,
+    tool_calls_log: list,
+    pending_tool_calls: dict,
+    connection_state: dict,
+    confirm_queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+    session_id: str,
+    tool_results_log: list,
+) -> tuple:
+    """Обрабатывает одну строку вывода qwen в SDK mode.
+    Возвращает (thinking_buffer, content_buffer, done).
+    """
+    line = line.strip()
+    if not line:
+        return thinking_buffer, content_buffer, False
+
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return thinking_buffer, content_buffer, False
+
+    tp = data.get("type", "")
+
+    # --- control_request: qwen просит подтверждения ---
+    if tp == "control_request":
+        req = data.get("request", {})
+        rid = data.get("request_id", "")
+        sub = req.get("subtype", "")
+
+        if sub == "can_use_tool":
+            tool_name = req.get("tool_name", "")
+            tool_input = req.get("input", {})
+
+            # Авто-одобрение если allow_all
+            if connection_state.get("allow_all"):
+                allow_resp = json.dumps({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": rid,
+                        "response": {"behavior": "allow"}
+                    }
+                })
+                try:
+                    proc.stdin.write(allow_resp + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                return thinking_buffer, content_buffer, False
+
+            # Показываем confirm UI во фронте
+            await _safe_send(ws, {
+                "type": "confirm_request",
+                "name": tool_name,
+                "args": tool_input
+            })
+
+            # Ждём ответа от пользователя
+            action = await _wait_for_confirmation(confirm_queue, stop_event)
+
+            if action == "stop":
+                stop_event.set()
+                deny_resp = json.dumps({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": rid,
+                        "response": {"behavior": "deny", "message": "Остановлено"}
+                    }
+                })
+                try:
+                    proc.stdin.write(deny_resp + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                return thinking_buffer, content_buffer, False
+
+            elif action == "deny":
+                deny_resp = json.dumps({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": rid,
+                        "response": {"behavior": "deny", "message": "Отклонено"}
+                    }
+                })
+                try:
+                    proc.stdin.write(deny_resp + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                await _safe_send(ws, {"type": "tool_denied", "name": tool_name})
+                return thinking_buffer, content_buffer, False
+
+            else:
+                # allow или allow_all
+                if action == "allow_all":
+                    connection_state["allow_all"] = True
+                    await _safe_send(ws, {"type": "allow_all_enabled"})
+
+                allow_resp = json.dumps({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": rid,
+                        "response": {"behavior": "allow"}
+                    }
+                })
+                try:
+                    proc.stdin.write(allow_resp + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+
+        return thinking_buffer, content_buffer, False
+
+    # --- control_response: ответ от qwen (init и т.д.) ---
+    if tp == "control_response":
+        return thinking_buffer, content_buffer, False
+
+    # --- system: пропускаем ---
+    if tp == "system":
+        return thinking_buffer, content_buffer, False
+
+    # --- assistant: thinking, text, tool_use ---
+    if tp == "assistant":
+        content_list = data.get("message", {}).get("content", [])
+        
+        # Защита: content может быть строкой вместо списка
+        if isinstance(content_list, str):
+            if content_list:
+                content_buffer += content_list
+                await _safe_send(ws, {"type": "content", "content": content_list})
+            return thinking_buffer, content_buffer, False
+        
+        for item in content_list:
+            it = item.get("type", "")
+
+            if it == "thinking":
+                t = item.get("thinking", "")
+                if t:
+                    thinking_buffer += t
+                    await _safe_send(ws, {"type": "thinking", "content": t})
+
+            elif it == "text":
+                c = item.get("text", "")
+                if c:
+                    content_buffer += c
+                    await _safe_send(ws, {"type": "content", "content": c})
+
+            elif it == "tool_use":
+                tool_name = item.get("name", "")
+                tool_args = item.get("input", {})
+                tool_id = item.get("id", "")
+
+                # Конвертируем в формат фронта
+                tool_calls_log.append({
+                    "function": {
+                        "name": tool_name,
+                        "arguments": tool_args
+                    }
+                })
+                pending_tool_calls[tool_id] = {"name": tool_name, "args": tool_args}
+
+                await _safe_send(ws, {
+                    "type": "tool_call",
+                    "name": tool_name,
+                    "args": tool_args
+                })
+
+        return thinking_buffer, content_buffer, False
+
+    # --- user (tool_result): qwen исполнил инструмент ---
+    if tp == "user":
+        content_list = data.get("message", {}).get("content", [])
+        for item in content_list:
+            if item.get("type") == "tool_result":
+                tool_use_id = item.get("tool_use_id", "")
+                
+                # Нормализуем content (может быть list или str)
+                raw_content = item.get("content", "")
+                if isinstance(raw_content, list):
+                    parts = []
+                    for part in raw_content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            parts.append(part.get("text", ""))
+                        elif isinstance(part, str):
+                            parts.append(part)
+                        else:
+                            parts.append(str(part))
+                    tool_content = "\n".join(parts)
+                else:
+                    tool_content = str(raw_content)
+
+                # Матчим по tool_use_id → tool_name
+                result_name = ""
+                if tool_use_id in pending_tool_calls:
+                    result_name = pending_tool_calls[tool_use_id]["name"]
+                    del pending_tool_calls[tool_use_id]
+
+                await _safe_send(ws, {
+                    "type": "tool_result",
+                    "name": result_name or tool_use_id,
+                    "content": tool_content[:3000]
+                })
+
+                # Копим в лог (сохраним позже в правильном порядке)
+                tool_results_log.append({"content": tool_content, "tool_name": result_name})
+
+        return thinking_buffer, content_buffer, False
+
+    # --- result: конец ---
+    if tp == "result":
+        return thinking_buffer, content_buffer, True
+
+    return thinking_buffer, content_buffer, False
+
+
+# ─── FastAPI ────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+    # Shutdown: закрываем MCP сессию
+    await mcp_manager.close()
+
+app = FastAPI(title="Qwen Agent", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Порядок: сначала RequestSizeLimitMiddleware (последний add_middleware = первый в цепочке)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+
+# Раздача статики React build (JS, CSS, images)
+_dist_dir = Path(__file__).parent / "static" / "dist"
+if _dist_dir.exists():
+    _assets_dir = _dist_dir / "assets"
+    if _assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="static-assets")
+
+
+@app.get("/")
+async def index():
+    # Отдаём собранный React фронтенд из dist/
+    html_path = Path(__file__).parent / "static" / "dist" / "index.html"
+    if not html_path.exists():
+        # Fallback на исходный index.html если dist нет
+        html_path = Path(__file__).parent / "static" / "index.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/user")
+async def api_user():
+    return {"id": "anonymous", "login": "Anonymous", "oauth_enabled": False}
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health-check endpoint для мониторинга."""
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database": db_ok,
+        "version": "1.0.0"
+    }
+
+
+@app.get("/api/sessions")
+async def api_sessions():
+    return get_sessions()
+
+
+@app.post("/api/sessions")
+async def api_create_session(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    title = body.get("title", "Новый чат")
+    return create_session(title)
+
+
+@app.delete("/api/sessions/{sid}")
+async def api_delete_session(sid: str):
+    # Остановить активную задачу если есть
+    if sid in background_tasks:
+        background_tasks[sid]["stop_event"].set()
+        # Даём время на завершение
+        task = background_tasks[sid]["task"]
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        except (asyncio.TimeoutError, Exception):
+            pass
+    delete_session(sid)
+    return {"ok": True}
+
+
+@app.put("/api/sessions/{sid}")
+async def api_rename_session(sid: str, request: Request):
+    body = await request.json()
+    rename_session(sid, body.get("title", ""))
+    return {"ok": True}
+
+
+@app.get("/api/sessions/{sid}/messages")
+async def api_messages(sid: str, limit: int = 50, offset: int = 0):
+    """Получить сообщения сессии с пагинацией."""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    total = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+        (sid, min(limit, 200), offset),
+    ).fetchall()
+    conn.close()
+    return {"messages": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/default-prompt")
+async def api_default_prompt():
+    return {"default_prompt": SYSTEM_PROMPT}
+
+
+@app.get("/api/sessions/{sid}/system-prompt")
+async def api_get_system_prompt(sid: str):
+    custom = get_session_prompt(sid)
+    return {"system_prompt": custom, "default_prompt": SYSTEM_PROMPT}
+
+
+@app.put("/api/sessions/{sid}/system-prompt")
+async def api_set_system_prompt(sid: str, request: Request):
+    body = await request.json()
+    prompt = body.get("system_prompt")
+    set_session_prompt(sid, prompt)
+    return {"ok": True, "system_prompt": prompt}
+
+
+@app.get("/api/sessions/{sid}/task-status")
+async def api_task_status(sid: str):
+    if sid in background_tasks:
+        task_info = background_tasks[sid]
+        return {"has_task": True, "done": task_info["task"].done(), "cancelled": task_info["task"].cancelled()}
+    return {"has_task": False}
+
+
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(ws: WebSocket, session_id: str):
+    await ws.accept()
+    logger.info(f"WebSocket подключен: {session_id}")
+
+    connection_state = {"allow_all": False}
+    msg_queue: asyncio.Queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+
+    async def ws_reader():
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(ws.receive_json(), timeout=30)  # 30 сек
+                except asyncio.TimeoutError:
+                    # Отправляем ping для поддержания соединения (heartbeat)
+                    try:
+                        await ws.send_json({"type": "ping"})
+                    except Exception:
+                        break  # Не можем отправить — соединение разорвано
+                    continue
+                logger.debug(f"Получено сообщение: {data.get('type')}")
+                if data.get("type") == "stop":
+                    if session_id in background_tasks:
+                        background_tasks[session_id]["stop_event"].set()
+                elif data.get("type") == "confirm_response":
+                    if session_id in background_tasks:
+                        await background_tasks[session_id]["confirm_queue"].put(
+                            data.get("action", "deny")
+                        )
+                else:
+                    await msg_queue.put(data)
+        except WebSocketDisconnect as e:
+            # Нормальное закрытие соединения — не логируем как ошибку
+            code = e.code if hasattr(e, 'code') else None
+            # 1000 = нормальное закрытие, 1001 = клиент уходит, 1005 = нет статуса, 1006 = разрыв
+            # 1012 = сервис перезагружается (uvicorn reload), 1013 = повторная попытка
+            if code in (1000, 1001, 1005, 1006, 1012, 1013):
+                logger.info(f"WebSocket закрыт: session_id={session_id}, code={code}")
+            else:
+                logger.warning(f"WebSocket закрыт с кодом {code}: session_id={session_id}")
+            await msg_queue.put(None)
+        except Exception as e:
+            # Реальная ошибка — логируем
+            logger.error(f"WebSocket reader ошибка: {e}", exc_info=True)
+            await msg_queue.put(None)
+
+    reader_task = asyncio.create_task(ws_reader())
+
+    try:
+        while True:
+            item = await msg_queue.get()
+            if item is None:
+                # Reader завершил работу — соединение закрыто
+                break
+            if item.get("type") == "message":
+                logger.info(f"Обработка сообщения для сессии {session_id}: {item['content'][:50]}...")
+                stop_event.clear()
+
+                confirm_queue = asyncio.Queue()
+                task_stop_event = asyncio.Event()
+                background_task = asyncio.create_task(
+                    stream_chat_background(
+                        session_id, item["content"],
+                        connection_state, task_stop_event, confirm_queue, ws
+                    )
+                )
+
+                background_tasks[session_id] = {
+                    "task": background_task,
+                    "stop_event": task_stop_event,
+                    "confirm_queue": confirm_queue,
+                }
+
+                try:
+                    await background_task
+                    logger.info(f"Задача завершена для сессии {session_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка в background_task: {e}", exc_info=True)
+                    try:
+                        await ws.send_json({"type": "error", "content": "Произошла внутренняя ошибка. Подробности в логе сервера."})
+                        await ws.send_json({"type": "response_end"})
+                    except Exception:
+                        break
+                finally:
+                    if session_id in background_tasks and background_tasks[session_id]["task"] == background_task:
+                        del background_tasks[session_id]
+    except asyncio.CancelledError:
+        # Нормальное завершение при shutdown
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket ошибка: {e}", exc_info=True)
+    finally:
+        # Отменяем reader_task при выходе
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        logger.info(f"WebSocket сессия завершена: {session_id}")
+
+
+@app.get("/{path:path}")
+async def spa_fallback(request: Request, path: str):
+    """SPA fallback — все неизвестные пути отдают index.html."""
+    if path.startswith("api/") or path.startswith("ws/") or path.startswith("auth/"):
+        raise HTTPException(status_code=404, detail="Not found")
+    html_path = Path(__file__).parent / "static" / "dist" / "index.html"
+    if not html_path.exists():
+        html_path = Path(__file__).parent / "static" / "index.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=10310, reload=True, log_level="info")
