@@ -1,6 +1,6 @@
 # Документация сервиса Qwen Agent
 
-**Версия:** 1.0.0
+**Версия:** 1.1.0
 **Авторы:** Claude Opus 4.6 + Qwen Code 3.5
 **Дата:** Март 2026
 
@@ -9,17 +9,15 @@
 ## Содержание
 
 1. [Обзор системы](#1-обзор-системы)
-2. [Архитектура](#2-архитектура)
-3. [Компоненты системы](#3-компоненты-системы)
-4. [Поток данных](#4-поток-данных)
-5. [Протокол взаимодействия](#5-протокол-взаимодействия)
-6. [Системный промпт](#6-системный-промпт)
-7. [Управление сессиями](#7-управление-сессиями)
-8. [MCP архитектура](#8-mcp-архитектура)
-9. [Фронтенд архитектура](#9-фронтенд-архитектура)
-10. [Безопасность](#10-безопасность)
-11. [Хранение данных](#11-хранение-данных)
-12. [Обработка ошибок](#12-обработка-ошибок)
+2. [Компоненты системы](#2-компоненты-системы)
+3. [Поток данных](#3-поток-данных)
+4. [Протокол взаимодействия](#4-протокол-взаимодействия)
+5. [Системный промпт](#5-системный-промпт)
+6. [Управление сессиями](#6-управление-сессиями)
+7. [MCP архитектура](#7-mcp-архитектура)
+8. [Безопасность](#8-безопасность)
+9. [Хранение данных](#9-хранение-данных)
+10. [Обработка ошибок](#10-обработка-ошибок)
 
 ---
 
@@ -29,81 +27,21 @@ Qwen Agent — это полнофункциональный веб-интерф
 
 ### Ключевые возможности
 
-- **Чат-интерфейс** — веб-UI на React 19 + TypeScript + Vite + Tailwind CSS 4
+- **Чат-интерфейс** — веб-UI на React с поддержкой множественных сессий
 - **Стриминг ответов** — отображение процесса мышления модели в реальном времени
 - **MCP инструменты** — выполнение системных команд через Model Context Protocol
 - **Подтверждение операций** — UI для подтверждения опасных команд (bash, ssh, файлы)
 - **Долгосрочная память** — сохранение фактов между сессиями через SQLite
-- **Множественные сессии** — параллельная работа с несколькими чатами
-
-### Технические характеристики
-
-| Компонент | Технология |
-|-----------|------------|
-| Бэкенд | FastAPI + Python 3.14 |
-| Фронтенд | React 19 + TypeScript + Vite 7 |
-| WebSocket | Нативный API браузера |
-| База данных | SQLite 3 (sessions.db) |
-| MCP | Model Context Protocol SDK |
-| AI | qwen-cli (SDK mode) |
 
 ---
 
-## 2. Архитектура
+## 2. Компоненты системы
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Браузер (Клиент)                         │
-│  React 19 + TypeScript + Vite + Tailwind CSS 4                  │
-│  WebSocket для стриминга ответов                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP/WebSocket (порт 10310)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    FastAPI Server (server.py)                   │
-│  • Управление сессиями (SQLite)                                 │
-│  • WebSocket handler                                            │
-│  • MCP Session Manager                                          │
-│  • Security Middleware                                          │
-└─────────────────────────────────────────────────────────────────┘
-                    │                           │
-                    │                           │
-                    ▼                           ▼
-┌───────────────────────────┐   ┌─────────────────────────────────┐
-│     qwen CLI (SDK mode)   │   │   MCP Server (mcp_tools_server) │
-│  --input-format stream-json│  │  Stdio transport                │
-│  --output-format stream-json│ │  Инструменты:                   │
-└───────────────────────────┘   │  • run_bash_command             │
-                                │  • run_ssh_command              │
-                                │  • write_file                   │
-                                │  • edit_file                    │
-                                └─────────────────────────────────┘
-                                            │
-                                            ▼
-                              ┌─────────────────────────┐
-                              │   SQLite (sessions.db)  │
-                              │   • sessions            │
-                              │   • messages            │
-                              │   • memory              │
-                              └─────────────────────────┘
-```
-
-### Слои архитектуры
-
-1. **Клиентский слой** — React SPA с WebSocket клиентом
-2. **Транспортный слой** — HTTP REST API + WebSocket
-3. **Серверный слой** — FastAPI приложение
-4. **Слой интеграции** — qwen CLI (SDK mode) + MCP сервер
-5. **Слой хранения** — SQLite база данных
-
----
-
-## 3. Компоненты системы
-
-### 3.1 FastAPI сервер (`server.py`)
+### 2.1 FastAPI сервер (`server.py`)
 
 **Назначение:** Основной сервер приложения, обрабатывающий HTTP запросы и WebSocket соединения.
+
+**Конфигурация:** Переменные окружения загружаются автоматически из `.env` через `python-dotenv`.
 
 **Основные функции:**
 
@@ -123,12 +61,14 @@ Qwen Agent — это полнофункциональный веб-интерф
 # Порядок применения (внешний → внутренний):
 1. SecurityHeadersMiddleware      # Security headers
 2. RequestSizeLimitMiddleware     # Лимит 5MB на запрос
-3. CORSMiddleware                 # CORS политики
+3. CORSMiddleware                 # CORS: allow_origins=["*"]
 ```
 
-### 3.2 MCP сервер (`mcp_tools_server.py`)
+### 2.2 MCP сервер (`mcp_tools_server.py`)
 
 **Назначение:** Сервер инструментов Model Context Protocol для выполнения системных операций.
+
+**Конфигурация:** База данных определяется через `DB_PATH = Path(__file__).parent / "sessions.db"`.
 
 **Инструменты:**
 
@@ -150,7 +90,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     """Редактирование файла (замена первого вхождения)."""
 ```
 
-### 3.3 Фронтенд (`static/src/`)
+### 2.3 Фронтенд (`static/src/`)
 
 **Технологии:**
 - React 19.2.3
@@ -159,7 +99,6 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 - Tailwind CSS 4.1.17
 - Framer Motion (анимации)
 - Highlight.js (подсветка кода)
-- Marked (Markdown рендеринг)
 
 **Основные компоненты:**
 
@@ -173,15 +112,12 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 | `ConfirmBar.tsx` | Панель подтверждения операций |
 | `StatusBar.tsx` | Индикатор состояния |
 | `SettingsModal.tsx` | Настройки сессии |
-| `EmptyState.tsx` | Пустое состояние чата |
-| `ThinkingBlock.tsx` | Блок мышления AI |
-| `ToolBlock.tsx` | Блок вызова инструментов |
 
 ---
 
-## 4. Поток данных
+## 3. Поток данных
 
-### 4.1 Обработка запроса пользователя
+### 3.1 Обработка запроса пользователя
 
 ```
 ┌──────────┐     ┌───────────┐     ┌────────────┐     ┌──────────┐     ┌─────────┐
@@ -248,7 +184,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
      │                │─────────────────────────────────────▶                │
 ```
 
-### 4.2 Функция `stream_chat_background()`
+### 3.2 Функция `stream_chat_background()`
 
 **Алгоритм работы:**
 
@@ -261,7 +197,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
    - Загрузка истории сообщений из БД
    - Получение кастомного системного промпта (если есть)
    - Инъекция сохранённой памяти через `read_memory_for_session()`
-   - Обрезка контекста по `MAX_CONTEXT_CHARS`
+   - Полный контекст передаётся без обрезки (управление лимитами — на стороне qwen-cli)
 
 3. **Запуск qwen CLI:**
    ```python
@@ -297,9 +233,9 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 ---
 
-## 5. Протокол взаимодействия
+## 4. Протокол взаимодействия
 
-### 5.1 WebSocket сообщения
+### 4.1 WebSocket сообщения
 
 #### Клиент → Сервер
 
@@ -355,7 +291,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 | `session_renamed` | `id: string`, `title: string` | Сессия переименована |
 | `ping` | — | Heartbeat (каждые 30 сек) |
 
-### 5.2 qwen CLI SDK protocol
+### 4.2 qwen CLI SDK protocol
 
 **Формат:** JSON Lines (каждое сообщение на отдельной строке)
 
@@ -412,9 +348,9 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 ---
 
-## 6. Системный промпт
+## 5. Системный промпт
 
-### 6.1 Структура промпта
+### 5.1 Структура промпта
 
 Системный промпт определяется в константе `SYSTEM_PROMPT` и включает:
 
@@ -429,21 +365,21 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 3. **Принципы работы:**
    ```
-   1. 🚀 ДЕЙСТВУЙ, НЕ РАССУЖДАЙ
-   2. 📋 РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ
-   3. 🎯 МИНИМУМ ТЕКСТА, МАКСИМУМ ДЕЛА
-   4. 🧠 ЗАПОМИНАЙ ВАЖНОЕ
-   5. ✅ ПРОВЕРЯЙ РЕЗУЛЬТАТЫ
-   6. 🔒 БЕЗОПАСНОСТЬ
+   1. ДЕЙСТВУЙ, НЕ РАССУЖДАЙ
+   2. РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ
+   3. МИНИМУМ ТЕКСТА, МАКСИМУМ ДЕЛА
+   4. ЗАПОМИНАЙ ВАЖНОЕ
+   5. ПРОВЕРЯЙ РЕЗУЛЬТАТЫ
+   6. БЕЗОПАСНОСТЬ
    ```
 
 4. **Примеры правильного поведения:**
    ```
-   ❌ ПЛОХО: «Я могу проверить содержимое директории командой ls»
-   ✅ ХОРОШО: [вызов list_directory(path="/home/andrew/qwen-agent")]
+   ПЛОХО: «Я могу проверить содержимое директории командой ls»
+   ХОРОШО: [вызов list_directory(path="/home/andrew/qwen-agent")]
    ```
 
-### 6.2 Инъекция памяти
+### 5.2 Инъекция памяти
 
 При построении контекста (`build_history()`) в промпт добавляется блок сохранённых фактов:
 
@@ -460,7 +396,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 3. Форматирование в виде списка
 4. Добавление как `system` сообщение после основного промпта
 
-### 6.3 Кастомный промпт сессии
+### 5.3 Кастомный промпт сессии
 
 Пользователь может установить кастомный системный промпт для сессии через Settings Modal.
 
@@ -476,9 +412,9 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
 
 ---
 
-## 7. Управление сессиями
+## 6. Управление сессиями
 
-### 7.1 Жизненный цикл сессии
+### 6.1 Жизненный цикл сессии
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -487,7 +423,7 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
 └─────────────┘     └──────────────┘     └─────────────┘     └─────────────┘
 ```
 
-### 7.2 Создание сессии
+### 6.2 Создание сессии
 
 **API:** `POST /api/sessions`
 
@@ -502,8 +438,7 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "title": "Мой новый чат",
   "created_at": "2026-03-01T12:00:00",
-  "updated_at": "2026-03-01T12:00:00",
-  "user_id": null
+  "updated_at": "2026-03-01T12:00:00"
 }
 ```
 
@@ -512,7 +447,7 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
 2. Запись в таблицу `sessions`
 3. Возврат данных клиенту
 
-### 7.3 Автоматическое переименование
+### 6.3 Автоматическое переименование
 
 При первом сообщении пользователя сессия автоматически переименовывается:
 
@@ -524,7 +459,7 @@ def auto_title(session_id: str, user_msg: str):
     # Обновление в БД только если это первое сообщение
 ```
 
-### 7.4 Контекст и лимиты
+### 6.4 Контекст
 
 **Функция `build_history()`:**
 
@@ -533,36 +468,14 @@ def auto_title(session_id: str, user_msg: str):
    - Инъекция памяти
    - История сообщений (user/assistant/tool)
 
-2. **Обрезка по лимиту:**
-   ```python
-   if MAX_CONTEXT_CHARS <= 0:
-       return history  # Без лимита
-
-   if _estimate_chars(history) <= MAX_CONTEXT_CHARS:
-       return history  # Укладывается
-
-   # Обрезка старых сообщений
-   trimmed = []
-   for m in reversed(all_msgs):
-       if budget - msg_size < 0:
-           break
-       budget -= msg_size
-       trimmed.append(m)
-   ```
-
-3. **Контекст notice:**
-   ```
-   [Контекст обрезан: показаны последние 50 из 120 сообщений.]
-   Темы из предыдущих сообщений пользователя:
-     • Как настроить сервер
-     • Установка пакетов
-   ```
+2. **Без искусственных ограничений:**
+   Полный контекст передаётся в qwen-cli. Управление лимитами контекста и результатов инструментов — на стороне qwen-cli.
 
 ---
 
-## 8. MCP архитектура
+## 7. MCP архитектура
 
-### 8.1 MCPSessionManager
+### 7.1 MCPSessionManager
 
 **Назначение:** Управление единственной MCP сессией (не привязана к session_id чата).
 
@@ -586,21 +499,17 @@ class MCPSessionManager:
 | `call_tool()` | Вызов инструмента |
 | `list_tools()` | Список доступных инструментов |
 
-### 8.2 Протокол MCP
+### 7.2 Протокол MCP
 
 **Транспорт:** Stdio (stdin/stdout)
 
 **Инициализация:**
 ```python
-env = {
-    **os.environ,
-    "MCP_DB_PATH": str(Path(DB_PATH).resolve()),
-}
 params = StdioServerParameters(
     command=MCP_PYTHON,
     args=[MCP_SERVER_SCRIPT],
     cwd=str(Path(__file__).parent),
-    env=env,
+    env={**os.environ},
 )
 ```
 
@@ -630,7 +539,7 @@ params = StdioServerParameters(
        │◀───────────────────│
 ```
 
-### 8.3 Инструменты и подтверждение
+### 7.3 Инструменты и подтверждение
 
 **Список инструментов требующих подтверждения:**
 
@@ -658,169 +567,7 @@ TOOLS_REQUIRING_CONFIRMATION = {
 
 ## 8. Безопасность
 
----
-
-## 9. Фронтенд архитектура
-
-### 9.1 Структура приложения
-
-**Точка входа:** `static/src/main.tsx`
-
-**Главный компонент:** `App.tsx`
-
-### 9.2 Компонент App.tsx
-
-**Состояния (useState):**
-
-| Состояние | Тип | Описание |
-|-----------|-----|----------|
-| `sessions` | `Session[]` | Список сессий |
-| `currentSession` | `Session \| null` | Текущая сессия |
-| `messages` | `Message[]` | История сообщений |
-| `isBusy` | `boolean` | Флаг активной генерации |
-| `phase` | `Phase` | Текущая фаза (idle/waiting/thinking/generating/tool/confirming) |
-| `sidebarOpen` | `boolean` | Открыта ли боковая панель |
-| `settingsOpen` | `boolean` | Открыто ли окно настроек |
-| `confirmRequest` | `ConfirmRequest \| null` | Запрос подтверждения |
-| `wsStatus` | `WsStatus` | Статус WebSocket подключения |
-| `streaming` | `StreamingMessage` | Текущее стримящееся сообщение |
-| `isStreamingActive` | `boolean` | Активен ли стриминг |
-
-**Фазы работы (Phase):**
-
-| Фаза | Описание |
-|------|----------|
-| `idle` | Ожидание сообщения |
-| `waiting` | Ожидание ответа от qwen |
-| `thinking` | AI думает (stream thinking) |
-| `generating` | AI генерирует ответ |
-| `tool` | Выполнение инструмента |
-| `confirming` | Ожидание подтверждения пользователя |
-
-### 9.3 WebSocket логика
-
-**Подключение:**
-```typescript
-const ws = api.createWebSocket(sessionId);
-wsRef.current = ws;
-```
-
-**Обработка сообщений:**
-```typescript
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  handleWsMessage(data);
-};
-```
-
-**Auto-reconnect:**
-- Экспоненциальная задержка (1s, 2s, 4s, 8s, 10s max)
-- Максимум 5 попыток
-- Reconnect только для той же сессии
-
-### 9.4 Компоненты UI
-
-#### Sidebar.tsx
-Боковая панель со списком сессий:
-- Отображение списка чатов
-- Переключение между сессиями
-- Создание новой сессии
-- Удаление сессии
-
-#### ChatHeader.tsx
-Заголовок чата:
-- Название текущей сессии
-- Кнопка открытия sidebar
-- Кнопка настроек
-
-#### ChatInput.tsx
-Поле ввода сообщения:
-- Textarea с авто-высотой
-- Кнопка отправки
-- Кнопка остановки генерации
-- Поддержка Ctrl+Enter
-
-#### MessageBubble.tsx
-Отображение сообщения:
-- Рендеринг Markdown (marked.js)
-- Подсветка кода (highlight.js)
-- Отображение thinking блока
-- Отображение tool вызовов
-
-#### ConfirmBar.tsx
-Панель подтверждения операций:
-- Название инструмента
-- Аргументы команды
-- Кнопки: Разрешить / Запретить / Разрешить все
-
-#### StatusBar.tsx
-Индикатор состояния:
-- Текущая фаза работы
-- Таймер выполнения
-- Статус WebSocket подключения
-
-#### SettingsModal.tsx
-Модальное окно настроек:
-- Переименование сессии
-- Установка кастомного системного промпта
-- Просмотр дефолтного промпта
-
-### 9.5 Рендеринг сообщений
-
-**Функция `renderMessageList()`:**
-
-Группирует сообщения для правильного отображения:
-1. `user` → отдельный bubble
-2. `assistant` / `assistant_tool_call` + `tool` × N → комбинированный bubble
-3. Стримящиеся сообщения → отдельный блок
-
-**Порядок сохранения в БД:**
-```
-assistant_tool_call (с tool_calls JSON)
-  ↓
-tool × N (результаты инструментов)
-  ↓
-assistant (финальный ответ)
-```
-
-### 9.6 Типы (types.ts)
-
-**Основные интерфейсы:**
-```typescript
-interface Session {
-  id: string;
-  title: string;
-  created_at: string;
-  updated_at: string;
-  user_id?: string;
-  system_prompt?: string;
-}
-
-interface Message {
-  id: number;
-  session_id: string;
-  role: 'user' | 'assistant' | 'assistant_tool_call' | 'tool';
-  content: string;
-  thinking?: string;
-  tool_calls?: string;
-  tool_name?: string;
-  created_at: string;
-}
-
-interface ToolCall {
-  id?: string;
-  function: {
-    name: string;
-    arguments: Record<string, unknown>;
-  };
-}
-```
-
----
-
-## 10. Безопасность
-
-### 10.1 Security headers
+### 8.1 Security headers
 
 ```python
 HEADERS = [
@@ -831,34 +578,44 @@ HEADERS = [
 ]
 ```
 
-### 10.2 Лимиты
+### 8.2 CORS
+
+Сервер доступен с любого адреса:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+### 8.3 Лимиты
 
 | Лимит | Значение |
 |-------|----------|
 | `MAX_REQUEST_SIZE` | 5 MB |
-| `MAX_CONTEXT_CHARS` | 0 (без лимита) или заданное |
-| `TOOL_RESULT_MAX_CHARS` | 0 (без лимита) или заданное |
 | Таймаут bash/ssh | 120 секунд |
 | Таймаут подтверждения | 300 секунд |
 
 ---
 
-## 11. Хранение данных
+## 9. Хранение данных
 
-### 11.1 SQLite схема
+### 9.1 SQLite схема
 
 **Таблица `sessions`:**
 ```sql
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,           -- UUID
-    user_id TEXT,                  -- OAuth user_id
+    user_id TEXT,                  -- зарезервировано
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     system_prompt TEXT DEFAULT NULL
 );
-
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
 ```
 
 **Таблица `messages`:**
@@ -892,7 +649,7 @@ CREATE TABLE memory (
 CREATE INDEX idx_memory_session_id ON memory(session_id);
 ```
 
-### 11.2 Порядок сохранения сообщений
+### 9.2 Порядок сохранения сообщений
 
 **Для сообщений с инструментами:**
 
@@ -918,7 +675,7 @@ assistant
 └─ thinking: "Содержимое thinking"
 ```
 
-### 11.3 Долгосрочная память
+### 9.3 Долгосрочная память
 
 **Автосохранение тем:**
 
@@ -943,9 +700,9 @@ def save_memory(key: str, value: str, session_id: str) -> str:
 
 ---
 
-## 12. Обработка ошибок
+## 10. Обработка ошибок
 
-### 12.1 Типы ошибок
+### 10.1 Типы ошибок
 
 | Тип | Обработка |
 |-----|-----------|
@@ -955,7 +712,7 @@ def save_memory(key: str, value: str, session_id: str) -> str:
 | Database error | Логирование, возврат ошибки клиенту |
 | Timeout | Отправка `error` сообщения |
 
-### 12.2 Механизм восстановления
+### 10.2 Механизм восстановления
 
 **При ошибке qwen процесса:**
 
@@ -979,7 +736,7 @@ except Exception:
     raise
 ```
 
-### 12.3 Логирование
+### 10.3 Логирование
 
 **Файл логов:** `server.log`
 
@@ -993,16 +750,6 @@ except Exception:
 - `WARNING` — предупреждения (fallback режимы)
 - `ERROR` — ошибки с traceback
 
-**Примеры:**
-```
-2026-03-01 12:00:00 - server - INFO - WebSocket подключен: session_id=abc-123
-2026-03-01 12:00:01 - server - INFO - Начало обработки: abc-123, сообщение: Привет...
-2026-03-01 12:00:05 - server - WARNING - qwen процесс завершился, пробуем без --resume
-2026-03-01 12:00:10 - server - ERROR - Ошибка: Connection refused
-    Traceback (most recent call last):
-      ...
-```
-
 ---
 
 ## Приложения
@@ -1011,18 +758,8 @@ except Exception:
 
 | Переменная | Описание | По умолчанию |
 |------------|----------|--------------|
-| `SESSION_SECRET` | Секрет для cookie | Случайный |
-| `QWEN_PATH` | Путь к qwen CLI | `/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen` |
+| `QWEN_PATH` | Путь к qwen CLI | автоопределение |
 | `MCP_PYTHON` | Python для MCP | `sys.executable` |
-| `MAX_CONTEXT_CHARS` | Лимит контекста | `0` |
-| `TOOL_RESULT_MAX_CHARS` | Лимит результата | `0` |
-| `OAUTH_ENABLED` | Включить OAuth | `false` |
-| `OAUTH_PROVIDER` | Провайдер | `github` |
-| `OAUTH_CLIENT_ID` | Client ID | — |
-| `OAUTH_CLIENT_SECRET` | Client Secret | — |
-| `OAUTH_REDIRECT_URI` | Redirect URI | `http://localhost:8080/auth/callback` |
-| `OAUTH_SCOPES` | Scopes | `user:email` |
-| `ALLOWED_ORIGINS` | CORS origins | `localhost:10310` |
 
 ### B. Порты
 
