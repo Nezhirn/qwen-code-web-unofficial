@@ -61,7 +61,7 @@ renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
       // fallback
     }
   }
-  return `<pre class="group relative"><div class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"><button onclick="navigator.clipboard.writeText(this.closest('pre').querySelector('code').textContent)" class="px-2 py-1 text-xs rounded bg-bg-tertiary text-text-secondary hover:text-text-primary border border-border transition-colors">Copy</button></div><code class="hljs language-${language}">${highlighted}</code></pre>`;
+  return `<pre class="group relative"><div class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"><button onclick="(async()=>{const c=this.closest('pre').querySelector('code').textContent;try{await navigator.clipboard.writeText(c);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)}catch{try{const t=document.createElement('textarea');t.value=c;t.style.cssText='position:fixed;opacity:0;left:-9999px';document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)}catch{}}})()" class="px-2 py-1 text-xs rounded bg-bg-tertiary text-text-secondary hover:text-text-primary border border-border transition-colors">Copy</button></div><code class="hljs language-${language}">${highlighted}</code></pre>`;
 };
 
 marked.use({ renderer });

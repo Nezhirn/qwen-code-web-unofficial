@@ -774,6 +774,21 @@ async def stream_chat_background(
         while not done:
             if stop_event.is_set():
                 _kill_proc(proc)
+                # Сохраняем накопленный контент ДО отправки stopped
+                if content_buffer or thinking_buffer or tool_calls_log:
+                    if tool_calls_log:
+                        save_message(session_id, "assistant_tool_call",
+                                    content_buffer, thinking=thinking_buffer,
+                                    tool_calls=tool_calls_log)
+                        for tr in tool_results_log:
+                            save_message(session_id, "tool", tr["content"], tool_name=tr["tool_name"])
+                    else:
+                        save_message(session_id, "assistant", content_buffer, thinking=thinking_buffer)
+                    # Очищаем буферы чтобы не сохранить дважды
+                    content_buffer = ""
+                    thinking_buffer = ""
+                    tool_calls_log = []
+                    tool_results_log = []
                 await _safe_send(ws, {"type": "stopped"})
                 break
 
@@ -793,7 +808,7 @@ async def stream_chat_background(
                 break
 
             try:
-                line = await asyncio.wait_for(_async_readline(proc), timeout=180)
+                line = await asyncio.wait_for(_async_readline(proc), timeout=600)
             except asyncio.TimeoutError:
                 _kill_proc(proc)
                 await _safe_send(ws, {"type": "error", "content": "Таймаут ожидания ответа qwen"})
@@ -1229,6 +1244,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                         await background_tasks[session_id]["confirm_queue"].put(
                             data.get("action", "deny")
                         )
+                elif data.get("type") == "set_allow_all":
+                    connection_state["allow_all"] = data.get("value", False)
+                    await _safe_send(ws, {
+                        "type": "allow_all_changed",
+                        "value": connection_state["allow_all"]
+                    })
                 else:
                     await msg_queue.put(data)
         except WebSocketDisconnect as e:

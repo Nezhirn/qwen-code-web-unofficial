@@ -22,6 +22,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
+  const [allowAll, setAllowAll] = useState(false);
 
   const [streaming, setStreaming] = useState<StreamingMessage>({
     thinking: '',
@@ -211,6 +212,11 @@ export function App() {
 
       case 'allow_all_enabled':
         setConfirmRequest(null);
+        setAllowAll(true);
+        break;
+
+      case 'allow_all_changed':
+        setAllowAll(data.value as boolean);
         break;
 
       case 'stream_end':
@@ -235,9 +241,13 @@ export function App() {
         setPhaseStart(null);
         setConfirmRequest(null);
         if (currentSessionRef.current) {
-          api.fetchMessages(currentSessionRef.current.id).then(setMessages).catch(console.error);
+          api.fetchMessages(currentSessionRef.current.id).then((msgs) => {
+            setMessages(msgs);
+            setStreaming({ thinking: '', content: '', tools: [] });
+          }).catch(console.error);
+        } else {
+          setStreaming({ thinking: '', content: '', tools: [] });
         }
-        setStreaming({ thinking: '', content: '', tools: [] });
         break;
 
       case 'error':
@@ -354,6 +364,12 @@ export function App() {
       setPhase('tool');
     }
   }, []);
+
+  const handleToggleAllowAll = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'set_allow_all', value: !allowAll }));
+    }
+  }, [allowAll]);
 
   const handleRenamed = useCallback((id: string, title: string) => {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
@@ -473,8 +489,14 @@ export function App() {
         </AnimatePresence>
 
         <AnimatePresence>
-          {(phase !== 'idle' || wsStatus !== 'connected') && (
-            <StatusBar phase={phase} startTime={phaseStart} wsStatus={wsStatus} />
+          {currentSession && (phase !== 'idle' || wsStatus !== 'connected') && (
+            <StatusBar
+              phase={phase}
+              startTime={phaseStart}
+              wsStatus={wsStatus}
+              allowAll={allowAll}
+              onToggleAllowAll={handleToggleAllowAll}
+            />
           )}
         </AnimatePresence>
 

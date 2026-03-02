@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import type { Phase } from '../types';
-import { Brain, Pencil, Wrench, ShieldQuestion, Loader2, Wifi, WifiOff } from 'lucide-react';
+import { Brain, Pencil, Wrench, ShieldQuestion, Loader2, Wifi, WifiOff, Shield, ShieldOff } from 'lucide-react';
 
 interface Props {
   phase: Phase;
   startTime: number | null;
   wsStatus?: 'connected' | 'connecting' | 'disconnected';
+  allowAll?: boolean;
+  onToggleAllowAll?: () => void;
 }
 
 const phaseConfig: Record<
@@ -55,7 +57,7 @@ const phaseConfig: Record<
   },
 };
 
-export default function StatusBar({ phase, startTime, wsStatus = 'connected' }: Props) {
+export default function StatusBar({ phase, startTime, wsStatus = 'connected', allowAll = false, onToggleAllowAll }: Props) {
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -150,15 +152,31 @@ export default function StatusBar({ phase, startTime, wsStatus = 'connected' }: 
         </div>
       )}
 
-      {/* Правая часть: WebSocket статус */}
-      <div className={`flex items-center gap-1.5 ${wsInfo.color}`}>
-        <motion.div
-          animate={wsStatus === 'connecting' ? { opacity: [1, 0.3, 1] } : {}}
-          transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
-        >
-          <WsIcon size={14} />
-        </motion.div>
-        <span className="text-xs font-medium">{wsInfo.label}</span>
+      {/* Правая часть: WebSocket статус + кнопка разрешений */}
+      <div className="flex items-center gap-3">
+        {onToggleAllowAll && (
+          <button
+            onClick={onToggleAllowAll}
+            className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium transition-all duration-200 active:scale-95 ${
+              allowAll
+                ? 'bg-warning/10 text-warning border border-warning/20 hover:bg-warning/20'
+                : 'bg-success/10 text-success border border-success/20 hover:bg-success/20'
+            }`}
+            title={allowAll ? 'Режим: авто-одобрение. Нажмите для переключения' : 'Режим: ручное подтверждение. Нажмите для переключения'}
+          >
+            {allowAll ? <ShieldOff size={12} /> : <Shield size={12} />}
+            {allowAll ? 'Авто' : 'Контроль'}
+          </button>
+        )}
+        <div className={`flex items-center gap-1.5 ${wsInfo.color}`}>
+          <motion.div
+            animate={wsStatus === 'connecting' ? { opacity: [1, 0.3, 1] } : {}}
+            transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
+          >
+            <WsIcon size={14} />
+          </motion.div>
+          <span className="text-xs font-medium">{wsInfo.label}</span>
+        </div>
       </div>
     </motion.div>
   );
