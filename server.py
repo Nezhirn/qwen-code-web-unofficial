@@ -558,10 +558,8 @@ async def _wait_for_confirmation(
         # None означает что соединение закрыто
         if data is None:
             return "stop"
-        if isinstance(data, str):
-            return data
-        if isinstance(data, dict):
-            return data.get("action", "deny")
+        # Возвращаем данные как есть - для question это dict, для confirm это строка или dict с action
+        return data
 
     # Таймаут - возвращаем stop чтобы не ждать вечно
     return "stop"
@@ -968,6 +966,8 @@ async def stream_chat_background(
                 pending_tool_calls, connection_state, confirm_queue,
                 stop_event, session_id, tool_results_log, last_tool_call_time, BASH_TOOLS
             )
+            if done:
+                break
     except asyncio.CancelledError:
         # Задача отменена - корректно завершаем процесс и отправляем сигнал
         logger.info(f"Задача отменена для сессии {session_id}")
@@ -1052,9 +1052,46 @@ async def _process_line(
         rid = data.get("request_id", "")
         sub = req.get("subtype", "")
 
+        logger.info(f"control_request: subtype={sub}, request_id={rid}")
+
         if sub == "can_use_tool":
             tool_name = req.get("tool_name", "")
             tool_input = req.get("input", {})
+
+            logger.info(f"can_use_tool: tool_name={tool_name}")
+
+            # Специальная обработка ask_user_question
+            if tool_name == "ask_user_question":
+                questions = tool_input.get("questions", [])
+
+                # Форматируем вопросы в красивый текст
+                formatted_text = ""
+                for i, q in enumerate(questions, 1):
+                    if i > 1:
+                        formatted_text += "\n"
+
+                    header = q.get("header", f"Question {i}")
+                    question = q.get("question", "")
+                    options = q.get("options", [])
+
+                    formatted_text += f"**{header}**: {question}\n"
+
+                    for j, opt in enumerate(options, 1):
+                        label = opt.get("label", "")
+                        description = opt.get("description", "")
+                        formatted_text += f"{j}. **{label}** — {description}\n"
+
+                # Отправляем вопросы как обычный content
+                await _safe_send(ws, {
+                    "type": "content",
+                    "content": formatted_text
+                })
+
+                # Убиваем процесс qwen
+                _kill_proc(proc)
+
+                # Возвращаем formatted_text в content_buffer и done=True
+                return thinking_buffer, content_buffer + formatted_text, True, last_tool_call_time
 
             # Авто-одобрение если allow_all
             if connection_state.get("allow_all"):
@@ -1082,6 +1119,10 @@ async def _process_line(
 
             # Ждём ответа от пользователя
             action = await _wait_for_confirmation(confirm_queue, stop_event)
+
+            # Обрабатываем ответ (может быть строка или dict с action)
+            if isinstance(action, dict):
+                action = action.get("action", "deny")
 
             if action == "stop":
                 stop_event.set()
@@ -1175,6 +1216,11 @@ async def _process_line(
 
             elif it == "tool_use":
                 tool_name = item.get("name", "")
+
+                # Полностью пропускаем ask_user_question - он будет обработан отдельно
+                if tool_name == "ask_user_question":
+                    continue
+
                 tool_args = item.get("input", {})
                 tool_id = item.get("id", "")
 

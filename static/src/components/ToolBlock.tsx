@@ -24,6 +24,7 @@ function getToolIcon(name: string) {
   if (name.includes('ssh')) return Server;
   if (name.includes('web') || name.includes('fetch') || name.includes('search')) return Globe;
   if (name.includes('memory')) return Database;
+  if (name.includes('todo')) return CheckCircle2;
   return Terminal;
 }
 
@@ -35,6 +36,14 @@ function getToolDisplayArgs(name: string, args: Record<string, unknown>): string
   if (name === 'save_memory') return `💾 ${args.key}: ${args.value}`;
   if (name === 'read_memory') return '📖 Чтение памяти';
   if (name === 'delete_memory') return `🗑️ ${args.key}`;
+  if (name === 'todo_write' && args.todos && Array.isArray(args.todos)) {
+    const todos = args.todos as Array<{content: string; status: string; activeForm?: string}>;
+    return todos.map((t, i) => {
+      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⏳';
+      return `${icon} ${t.content}`;
+    }).join('\n');
+  }
+  if (name === 'todo_read') return '📋 Чтение списка задач';
   return JSON.stringify(args, null, 2);
 }
 
