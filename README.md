@@ -152,7 +152,7 @@ npm run build
 python server.py
 ```
 
-Сервер запускает FastAPI с встроенным static files serving. Приложение доступно по адресу, указанному в конфигурации сервера (обычно `http://localhost:8000`).
+Сервер запускает FastAPI с встроенным static files serving. Приложение доступно по адресу http://localhost:10310
 
 ## 📁 Структура проекта
 
