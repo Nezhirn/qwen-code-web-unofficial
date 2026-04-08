@@ -1422,7 +1422,7 @@ async def health_check():
 
 @app.get("/api/sessions")
 @limiter.limit("30/minute")
-async def api_sessions():
+async def api_sessions(request: Request):
     return get_sessions()
 
 
@@ -1439,7 +1439,7 @@ async def api_create_session(request: Request):
 
 @app.delete("/api/sessions/{sid}")
 @limiter.limit("20/minute")
-async def api_delete_session(sid: str):
+async def api_delete_session(sid: str, request: Request):
     # Остановить активную задачу если есть
     if sid in background_tasks:
         background_tasks[sid]["stop_event"].set()

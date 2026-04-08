@@ -1,373 +1,426 @@
-# Qwen Agent
+# Qwen Agent — Веб-интерфейс для Qwen CLI с MCP
 
-![Описание картинки](https://lh3.googleusercontent.com/d/1L6Ya-BCRb8AdSndyjB2mLf0GiPzCwwVK)
-**Веб-интерфейс для qwen-cli с поддержкой MCP инструментов**
+Автономный AI-ассистент с веб-интерфейсом для работы с системой, интернетом и памятью. Построен на базе Qwen CLI с поддержкой Model Context Protocol (MCP) для расширения инструментов.
 
----
+## 🚀 Возможности
 
-## Авторы
+### Основной функционал
+- **Стриминг ответов в реальном времени** — отображение thinking-блоков и генерации контента
+- **Множественные сессии чатов** — управление несколькими диалогами с сохранением истории
+- **Tool calling loop** — автоматическое выполнение инструментов с циклом обратной связи
+- **Подтверждение опасных команд** — интерактивное подтверждение для bash/ssh/file операций
+- **Остановка генерации** — возможность остановить выполнение в любой момент
+- **Долгосрочная память** — сохранение важной информации между сессиями
 
-**Claude Opus 4.6 + Qwen Code 3.5**
+### MCP Инструменты
+- 🔹 **run_bash_command** — выполнение bash-команд на сервере (таймаут: 120с)
+- 🔹 **run_ssh_command** — SSH-подключение к удалённым серверам
+- 🔹 **write_file** — запись содержимого в файлы
+- 🔹 **edit_file** — редактирование файлов (замена строк)
+- 🔹 **save_memory** — сохранение фактов в долгосрочную память
+- 🔹 **read_memory** — чтение сохранённых фактов
+- 🔹 **delete_memory** — удаление записей из памяти
 
----
+### Нативные инструменты Qwen CLI
+- 📂 **read_file** — чтение файлов
+- 📂 **list_directory** — список файлов в директории
+- 🔍 **glob** — поиск файлов по шаблону
+- 🔍 **grep_search** — поиск по содержимому файлов
+- 🌐 **web_fetch** — загрузка веб-страниц
+- 🌐 **web_search** — поиск в интернете
+- ✅ **todo_write/todo_read** — управление задачами
 
-## Оглавление
-
-1. [Описание](#описание)
-2. [Архитектура](#архитектура)
-3. [Требования](#требования)
-4. [Установка](#установка)
-5. [Конфигурация](#конфигурация)
-6. [Запуск](#запуск)
-7. [Переменные окружения](#переменные-окружения)
-8. [API](#api)
-9. [MCP инструменты](#mcp-инструменты)
-10. [Структура проекта](#структура-проекта)
-
----
-
-## Описание
-
-Qwen Agent — это веб-приложение на базе FastAPI, предоставляющее интерфейс для работы с AI-ассистентом Qwen через CLI. Приложение поддерживает:
-
-- **Множественные сессии чатов** с сохранением истории в SQLite
-- **MCP (Model Context Protocol) инструменты** для выполнения системных команд
-- **Подтверждение опасных операций** (bash, ssh, запись файлов) перед выполнением
-- **Стриминг ответов** с отображением процесса мышления модели
-- **Долгосрочную память** через save_memory/read_memory инструменты
-
----
-
-## Архитектура
+## 🏗️ Архитектура
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Браузер (Клиент)                         │
-│  React + TypeScript + Vite + Tailwind CSS                       │
-│  WebSocket для стриминга ответов                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP/WebSocket (порт 10310)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    FastAPI Server (server.py)                   │
-│  • Управление сессиями (SQLite)                                 │
-│  • WebSocket handler                                            │
-│  • MCP Session Manager                                          │
-│  • CORS: allow_origins=["*"]                                    │
-└─────────────────────────────────────────────────────────────────┘
-                    │                           │
-                    │                           │
-                    ▼                           ▼
-┌───────────────────────────┐   ┌─────────────────────────────────┐
-│     qwen CLI (SDK mode)   │   │   MCP Server (mcp_tools_server) │
-│  --input-format stream-json│  │  Stdio transport                │
-│  --output-format stream-json│ │  Инструменты:                   │
-└───────────────────────────┘   │  • run_bash_command             │
-                                │  • run_ssh_command              │
-                                │  • write_file                   │
-                                │  • edit_file                    │
-                                └─────────────────────────────────┘
-                                            │
-                                            ▼
-                              ┌─────────────────────────┐
-                              │   SQLite (sessions.db)  │
-                              │   • sessions            │
-                              │   • messages            │
-                              │   • memory              │
-                              └─────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    Frontend (React)                      │
+│  ┌─────────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │  App.tsx    │  │ WebSocket│  │  Компоненты UI   │   │
+│  │  State Mgmt │  │  Client  │  │ (Sidebar, Chat,  │   │
+│  └──────┬──────┘  └────┬─────┘  │  MessageBubble)  │   │
+│         │              │        └──────────────────┘   │
+└─────────┼──────────────┼───────────────────────────────┘
+          │              │
+          ▼              ▼
+┌─────────────────────────────────────────────────────────┐
+│              Backend (FastAPI + Python)                  │
+│  ┌──────────────┐  ┌───────────────┐  ┌─────────────┐  │
+│  │  server.py   │  │ WebSocket API │  │  REST API   │  │
+│  │  Qwen CLI    │◄─┤  Streaming    │  │  Sessions   │  │
+│  │  Integration │  │  Tool Calls   │  │  Messages   │  │
+│  └──────┬───────┘  └───────────────┘  └─────────────┘  │
+│         │                                               │
+└─────────┼───────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────────┐
+│              MCP Server (mcp_tools_server.py)            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
+│  │   Bash   │  │   SSH    │  │  Write   │  │  Edit  │  │
+│  │ Commands │  │ Commands │  │   File   │  │  File  │  │
+│  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
+└─────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────────┐
+│                   SQLite Database                        │
+│  ┌────────────┐  ┌──────────┐  ┌──────────┐            │
+│  │  sessions  │  │ messages │  │  memory  │            │
+│  └────────────┘  └──────────┘  └──────────┘            │
+└─────────────────────────────────────────────────────────┘
 ```
 
----
+## 📦 Технологический стек
 
-## Требования
+### Backend
+- **FastAPI** — асинхронный веб-фреймворк
+- **WebSocket** — стриминг данных в реальном времени
+- **SQLite** — хранение сессий, сообщений и памяти
+- **MCP SDK** — Model Context Protocol для инструментов
+- **SlowAPI** — rate limiting
 
-### Системные требования
+### Frontend
+- **React 18+** — библиотека UI
+- **TypeScript** — типизация
+- **Vite** — сборщик
+- **Framer Motion** — анимации
+- **Tailwind CSS** — стилизация
 
-- **ОС:** Linux (протестировано на Arch Linux)
-- **Python:** 3.10+ (рекомендуется 3.14)
-- **Node.js:** 18+ (для сборки фронтенда)
-- **qwen CLI:** установлен и доступен
+## 🛠️ Установка
 
-### Python зависимости
-
-```
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-websockets>=12.0
-mcp>=1.0.0
-httpx>=0.26.0
-python-dotenv>=1.0.0
-beautifulsoup4>=4.12.0
-requests>=2.31.0
-```
-
-### Node.js зависимости (фронтенд)
-
-См. `static/package.json`
-
----
-
-## Установка
+### Требования
+- Python 3.10+
+- Node.js 18+
+- Qwen CLI (установлен и доступен в PATH)
 
 ### 1. Клонирование репозитория
-
 ```bash
-git clone git@github.com:Nezhirn/qwen-code-web-unofficial.git
-cd qwen-code-web-unofficial
+git clone <repository-url>
+cd qwen-code-web-unofficial_prod
 ```
 
-### 2. Установка Python зависимостей
-
+### 2. Установка зависимостей backend
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Установка Node.js зависимостей (для сборки фронтенда)
-
+### 3. Установка зависимостей frontend
 ```bash
 cd static
 npm install
-npm run build
 cd ..
 ```
 
-### 4. Проверка qwen CLI
+### 4. Настройка окружения
+Создайте файл `.env` в корне проекта:
+```env
+# Путь к Qwen CLI (опционально, если не в PATH)
+QWEN_PATH=/path/to/qwen
 
-Убедитесь, что qwen CLI установлен и доступен:
-
-```bash
-qwen --version
+# Python для MCP сервера (опционально, по умолчанию sys.executable)
+MCP_PYTHON=/usr/bin/python3
 ```
 
-Если используется кастомный путь, настройте переменную `QWEN_PATH` в `.env`.
+## 🚀 Запуск
 
----
+### Режим разработки
 
-## Конфигурация
-
-### Файл `.env`
-
-Создайте файл `.env` в корне проекта. Переменные загружаются автоматически через `python-dotenv`:
-
-```bash
-# Путь к Python для MCP (по умолчанию используется sys.executable)
-export MCP_PYTHON="/path/to/python"
-
-# Путь к qwen CLI
-export QWEN_PATH="/path/to/qwen"
-```
-
----
-
-## Запуск
-
-### Разработка (с auto-reload)
-
+#### 1. Запуск backend
 ```bash
 python server.py
 ```
 
-Или через uvicorn напрямую:
-
+#### 2. Запуск frontend (в отдельном терминале)
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 10310 --reload
+cd static
+npm run dev
 ```
 
-### Продакшн
+Приложение доступно по адресу: `http://localhost:5173`
 
+### Продакшен режим
+
+#### Сборка frontend
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 10310
+cd static
+npm run build
 ```
 
-### Доступ к приложению
+#### Запуск сервера
+```bash
+python server.py
+```
 
-Откройте в браузере: `http://localhost:10310`
+Сервер запускает FastAPI с встроенным static files serving. Приложение доступно по адресу, указанному в конфигурации сервера (обычно `http://localhost:8000`).
 
-Сервер доступен с любого адреса (CORS: `allow_origins=["*"]`).
+## 📁 Структура проекта
 
----
+```
+qwen-code-web-unofficial_prod/
+├── server.py                 # Основной сервер (FastAPI + WebSocket + Qwen CLI)
+├── mcp_tools_server.py       # MCP сервер для инструментов (bash, ssh, files)
+├── system_prompt.py          # Системный промпт для Qwen Agent
+├── requirements.txt          # Python зависимости
+├── .env                      # Переменные окружения (не отслеживается git)
+│
+├── static/                   # Frontend приложение
+│   ├── index.html            # HTML шаблон
+│   ├── package.json          # Node зависимости
+│   ├── vite.config.ts        # Конфигурация Vite
+│   ├── tsconfig.json         # Конфигурация TypeScript
+│   └── src/
+│       ├── main.tsx          # Точка входа React
+│       ├── App.tsx           # Главный компонент приложения
+│       ├── api.ts            # API функции (REST + WebSocket)
+│       ├── types.ts          # TypeScript типы
+│       ├── index.css         # Глобальные стили
+│       ├── components/       # React компоненты
+│       │   ├── Sidebar.tsx           # Боковая панель с сессиями
+│       │   ├── ChatHeader.tsx        # Шапка чата
+│       │   ├── ChatInput.tsx         # Поле ввода сообщений
+│       │   ├── MessageBubble.tsx     # Компонент сообщения
+│       │   ├── StatusBar.tsx         # Статусная строка
+│       │   ├── ConfirmBar.tsx        # Панель подтверждения команд
+│       │   ├── SettingsModal.tsx     # Модальное окно настроек
+│       │   ├── EmptyState.tsx        # Пустое состояние
+│       │   ├── ThinkingBlock.tsx     # Блок thinking процесса
+│       │   └── ToolBlock.tsx         # Блок выполнения инструмента
+│       └── utils/
+│           ├── cn.ts         # Утилита для CSS классов
+│           └── markdown.ts   # Парсинг markdown
+│
+└── sessions.db               # База данных SQLite (создаётся автоматически)
+```
 
-## Переменные окружения
+## 🔧 Конфигурация
+
+### Переменные окружения
 
 | Переменная | Описание | По умолчанию |
 |------------|----------|--------------|
-| `QWEN_PATH` | Путь к исполняемому файлу qwen CLI | автоопределение |
-| `MCP_PYTHON` | Путь к Python для MCP сервера | `sys.executable` (текущий Python) |
+| `QWEN_PATH` | Путь к qwen CLI | Ищет в PATH через `which` |
+| `MCP_PYTHON` | Python интерпретатор для MCP сервера | `sys.executable` |
 
-Контекст и лимиты результатов инструментов управляются qwen-cli.
+### Rate Limiting
+Настроен через SlowAPI. Конфигурация по умолчанию ограничивает количество запросов с одного IP.
 
----
+### Безопасность
+- **Размер запросов**: лимит 50 MB
+- **SSH**: требуется настроенный SSH ключ (`~/.ssh/id_ed25519`)
+- **File operations**: запись разрешена только в безопасные директории:
+  - Текущая директория проекта
+  - `~/projects`
+  - `~/workspace`
+  - `/tmp`
+- **Process isolation**: использование process groups для корректного завершения процессов
 
-## API
+## 📊 База данных
 
-### REST API
+### Таблица `sessions`
+| Колонка | Тип | Описание |
+|---------|-----|----------|
+| id | TEXT | UUID сессии (PRIMARY KEY) |
+| user_id | TEXT | ID пользователя (опционально) |
+| title | TEXT | Название чата |
+| created_at | TEXT | Дата создания (ISO 8601) |
+| updated_at | TEXT | Дата обновления (ISO 8601) |
+| system_prompt | TEXT | Кастомный системный промпт (опционально) |
 
-| Метод | Эндпоинт | Описание |
-|-------|----------|----------|
-| `GET` | `/` | Главная страница (React SPA) |
-| `GET` | `/api/health` | Health-check |
-| `GET` | `/api/sessions` | Список сессий |
-| `POST` | `/api/sessions` | Создать сессию |
-| `DELETE` | `/api/sessions/{id}` | Удалить сессию |
-| `PUT` | `/api/sessions/{id}` | Переименовать сессию |
-| `GET` | `/api/sessions/{id}/messages` | Сообщения сессии |
-| `GET` | `/api/sessions/{id}/system-prompt` | Системный промпт сессии |
-| `PUT` | `/api/sessions/{id}/system-prompt` | Установить системный промпт |
-| `GET` | `/api/default-prompt` | Системный промпт по умолчанию |
-| `GET` | `/api/user` | Текущий пользователь |
+### Таблица `messages`
+| Колонка | Тип | Описание |
+|---------|-----|----------|
+| id | INTEGER | AUTOINCREMENT PRIMARY KEY |
+| session_id | TEXT | FK → sessions.id |
+| role | TEXT | user/assistant/assistant_tool_call/tool |
+| content | TEXT | Содержание сообщения |
+| thinking | TEXT | Thinking блок (опционально) |
+| tool_calls | TEXT | JSON с вызовами инструментов |
+| tool_name | TEXT | Название инструмента |
+| created_at | TEXT | Дата создания (ISO 8601) |
 
-### WebSocket
+### Таблица `memory`
+| Колонка | Тип | Описание |
+|---------|-----|----------|
+| id | INTEGER | AUTOINCREMENT PRIMARY KEY |
+| session_id | TEXT | FK → sessions.id |
+| key | TEXT | Ключ факта |
+| value | TEXT | Значение факта |
+| created_at | TEXT | Дата создания (ISO 8601) |
 
-**Подключение:** `ws://localhost:10310/ws/{session_id}`
+## 🔄 WebSocket протокол
 
-**Сообщения клиент → сервер:**
-
-```json
-{"type": "message", "content": "Текст сообщения"}
-{"type": "stop"}
-{"type": "confirm_response", "action": "allow|deny|allow_all"}
+### Подключение
+```
+ws://host/ws/{session_id}
 ```
 
-**Сообщения сервер → клиент:**
+### Клиент → Сервер
 
-| Тип | Описание |
-|-----|----------|
-| `response_start` | Начало обработки |
-| `stream_start` | Начало стриминга |
-| `thinking` | Фрагмент мышления |
-| `content` | Фрагмент ответа |
-| `tool_call` | Вызов инструмента |
-| `tool_result` | Результат инструмента |
-| `tool_denied` | Инструмент запрещён |
-| `confirm_request` | Запрос подтверждения |
-| `allow_all_enabled` | Разрешены все инструменты |
-| `response_end` | Конец ответа |
-| `stopped` | Остановлено пользователем |
-| `error` | Ошибка |
-| `session_renamed` | Сессия переименована |
-| `ping` | Heartbeat |
+| Тип сообщения | Описание | Поля |
+|---------------|----------|------|
+| `message` | Отправка сообщения | `content: string` |
+| `stop` | Остановка генерации | — |
+| `confirm_response` | Ответ на подтверждение | `action: "allow" \| "deny" \| "allow_all"` |
+| `set_allow_all` | Включить/выключить авто-подтверждение | `value: boolean` |
 
----
+### Сервер → Клиент
 
-## MCP инструменты
+| Тип сообщения | Описание | Поля |
+|---------------|----------|------|
+| `response_start` | Начало ответа | — |
+| `stream_start` | Начало стриминга | — |
+| `thinking` | Thinking контент | `content: string` |
+| `content` | Основной контент | `content: string` |
+| `tool_call` | Вызов инструмента | `name: string`, `args: object` |
+| `tool_result` | Результат инструмента | `name: string`, `content: string` |
+| `confirm_request` | Запрос подтверждения | `name: string`, `args: object` |
+| `tool_denied` | Инструмент запрещён | `name: string` |
+| `response_end` | Ответ завершён | — |
+| `stopped` | Генерация остановлена | — |
+| `error` | Ошибка | — |
+| `session_renamed` | Сессия переименована | `id: string`, `title: string` |
+| `allow_all_enabled` | Авто-подтверждение включено | — |
+| `allow_all_changed` | Изменение авто-подтверждения | `value: boolean` |
+| `ping` | Ping для поддержания соединения | — |
 
-### Встроенные инструменты
+## 🎨 Фронтенд компоненты
 
-| Инструмент | Описание | Требует подтверждения |
-|------------|----------|----------------------|
-| `run_bash_command` | Выполнение bash команды | ✅ |
-| `run_ssh_command` | SSH команда на удалённом сервере | ✅ |
-| `write_file` | Запись в файл | ✅ |
-| `edit_file` | Редактирование файла | ✅ |
+### App.tsx
+Главный компонент приложения. Управляет:
+- Состоянием сессий и сообщений
+- WebSocket подключением
+- Обработкой стриминга
+- Подтверждением команд
 
-### Инструменты qwen CLI (нативные)
+### Sidebar.tsx
+Боковая панель со списком сессий. Позволяет:
+- Переключаться между сессиями
+- Создавать новые сессии
+- Удалять сессии
 
-- `run_shell_command` — bash команды
-- `read_file` — чтение файлов
-- `write_file` — запись файлов
-- `edit_file` — редактирование файлов
-- `list_directory` — список файлов
-- `glob` — поиск файлов
-- `grep_search` — поиск по содержимому
-- `web_fetch` — загрузка веб-страниц
-- `web_search` — поиск в интернете
-- `todo_write` / `todo_read` — управление задачами
-- `save_memory` / `read_memory` — долгосрочная память
+### MessageBubble.tsx
+Компонент отображения сообщения. Поддерживает:
+- Пользовательские сообщения
+- Ассистент сообщения с thinking
+- Tool call/results блоки
+- Markdown рендеринг
 
----
+### ConfirmBar.tsx
+Панель подтверждения опасных команд. Показывает:
+- Название инструмента
+- Аргументы команды
+- Кнопки allow/deny/allow_all
 
-## Структура проекта
+### StatusBar.tsx
+Статусная строка показывает:
+- Текущую фазу (waiting/thinking/generating/tool)
+- Статус WebSocket подключения
+- Переключатель allow_all
 
+## 🔐 Безопасность
+
+### Опасные инструменты требуют подтверждения
+- `run_bash_command`
+- `run_ssh_command`
+- `write_file`
+- `edit_file`
+
+### Таймауты
+- Создание MCP сессии: **30 секунд**
+- MCP tool вызов: **180 секунд**
+- Bash команда: **120 секунд**
+- SSH команда: **120 секунд**
+- Ожидание подтверждения: **300 секунд**
+
+### Rate Limiting
+- Настроен через SlowAPI
+- Ограничение запросов с одного IP
+
+### Валидация путей
+- Предотвращение path traversal attacks
+- Разрешена запись только в безопасные директории
+
+## 🧪 Разработка
+
+### Добавление нового MCP инструмента
+
+1. Добавьте функцию в `mcp_tools_server.py`:
+```python
+@mcp.tool()
+def my_new_tool(param1: str) -> str:
+    """Описание инструмента для модели."""
+    # Реализация
+    return result
 ```
-qwen-code-web-unofficial/
-├── server.py              # Основной FastAPI сервер
-├── mcp_tools_server.py    # MCP сервер с инструментами
-├── requirements.txt       # Python зависимости
-├── .env                   # Переменные окружения
-├── sessions.db            # SQLite база данных
-├── server.log             # Лог файл
-├── static/                # Фронтенд
-│   ├── package.json       # Node.js зависимости
-│   ├── tsconfig.json      # TypeScript конфиг
-│   ├── vite.config.ts     # Vite конфиг
-│   ├── index.html         # HTML шаблон
-│   ├── dist/              # Сборка для продакшна
-│   └── src/
-│       ├── main.tsx       # Точка входа React
-│       ├── App.tsx        # Главный компонент
-│       ├── api.ts         # API клиент
-│       ├── types.ts       # TypeScript типы
-│       ├── index.css      # Стили
-│       ├── components/    # React компоненты
-│       │   ├── Sidebar.tsx
-│       │   ├── ChatHeader.tsx
-│       │   ├── ChatInput.tsx
-│       │   ├── MessageBubble.tsx
-│       │   ├── ConfirmBar.tsx
-│       │   ├── StatusBar.tsx
-│       │   ├── SettingsModal.tsx
-│       │   ├── EmptyState.tsx
-│       │   ├── ThinkingBlock.tsx
-│       │   └── ToolBlock.tsx
-│       └── utils/         # Утилиты
-└── README.md              # Этот файл
+
+2. Если требует подтверждения, добавьте в `server.py`:
+```python
+TOOLS_REQUIRING_CONFIRMATION = {
+    ...,
+    "my_new_tool"
+}
 ```
 
----
+### Кастомизация системного промпта
+Отредактируйте `system_prompt.py` или используйте кастомный промпт для каждой сессии через SettingsModal.
 
-## База данных
+## 🐛 Troubleshooting
 
-### Таблицы
+### Qwen CLI не найден
+```bash
+# Установите qwen или укажите путь в .env
+export QWEN_PATH=/path/to/qwen
+```
 
-**sessions**
-- `id` (TEXT, PRIMARY KEY) — UUID сессии
-- `user_id` (TEXT) — зарезервировано
-- `title` (TEXT) — Заголовок чата
-- `created_at` (TEXT) — Дата создания
-- `updated_at` (TEXT) — Дата обновления
-- `system_prompt` (TEXT) — Кастомный системный промпт
+### MCP сервер не запускается
+```bash
+# Проверьте зависимости
+pip install -r requirements.txt
 
-**messages**
-- `id` (INTEGER, PRIMARY KEY)
-- `session_id` (TEXT, FK)
-- `role` (TEXT) — user/assistant/assistant_tool_call/tool
-- `content` (TEXT)
-- `thinking` (TEXT) — Содержимое thinking
-- `tool_calls` (TEXT, JSON) — Вызовы инструментов
-- `tool_name` (TEXT) — Название инструмента
-- `created_at` (TEXT)
+# Проверьте логи
+cat server.log
+```
 
-**memory**
-- `id` (INTEGER, PRIMARY KEY)
-- `session_id` (TEXT, FK)
-- `key` (TEXT)
-- `value` (TEXT)
-- `created_at` (TEXT)
+### WebSocket не подключается
+- Убедитесь что сервер запущен
+- Проверьте CORS настройки в `server.py`
+- Откройте DevTools консоль для ошибок
 
----
+### База данных заблокирована
+```bash
+# Удалите файл блокировки (если нет активных запросов)
+rm sessions.db-wal
+rm sessions.db-shm
+```
 
-## Безопасность
+## 📝 Планы развития
 
-### Middleware
+- [ ] Мультипользовательский режим с авторизацией
+- [ ] Экспорт/импорт сессий (JSON, Markdown)
+- [ ] Голосовой ввод
+- [ ] Поддержка нескольких моделей
+- [ ] Горячие клавиши
+- [ ] Темная/светлая тема
+- [ ] Мобильная адаптация
+- [ ] PWA поддержка
 
-1. **RequestSizeLimitMiddleware** — ограничение размера запроса (5 MB)
-2. **SecurityHeadersMiddleware** — security headers:
-   - `X-Content-Type-Options: nosniff`
-   - `X-Frame-Options: DENY`
-   - `X-XSS-Protection: 1; mode=block`
-   - `Referrer-Policy: strict-origin-when-cross-origin`
+## 📄 Лицензия
 
-### Подтверждение операций
+Некоммерческий проект для обучения и экспериментов с AI.
 
-Инструменты требующие подтверждения:
-- `bash`, `shell`, `run_bash_command`, `execute_command`
-- `ssh`, `run_ssh_command`, `remote_command`
-- `write_file`, `create_file`
-- `edit_file`, `replace_in_file`
+## 🤝 Контрибьюция
 
----
+1. Fork репозиторий
+2. Создайте ветку (`git checkout -b feature/amazing-feature`)
+3. Commit изменения (`git commit -m 'Add amazing feature'`)
+4. Push в ветку (`git push origin feature/amazing-feature`)
+5. Откройте Pull Request
 
-## Лицензия
+## 📞 Поддержка
 
-MIT
+При возникновении проблем открывайте Issue в репозитории с:
+- Описанием проблемы
+- Шагами воспроизведения
+- Логами из `server.log`
+- Версией Python и Node.js
