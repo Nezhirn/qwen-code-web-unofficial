@@ -2,6 +2,7 @@ import { useRef, useEffect, useMemo } from 'react';
 import { motion } from 'framer-motion';
 import { User, Bot, Copy, Check } from 'lucide-react';
 import { useState } from 'react';
+import DOMPurify from 'isomorphic-dompurify';
 import ThinkingBlock from './ThinkingBlock';
 import ToolBlock from './ToolBlock';
 import { renderMarkdown, highlightAll } from '../utils/markdown';
@@ -69,7 +70,15 @@ export default function MessageBubble({
 
   const renderedContent = useMemo(() => {
     if (!content) return '';
-    return renderMarkdown(content);
+    const html = renderMarkdown(content);
+    // Санитизация HTML для предотвращения XSS
+    return DOMPurify.sanitize(html, {
+      ALLOWED_TAGS: ['p', 'br', 'strong', 'b', 'em', 'i', 'code', 'pre', 'blockquote',
+                      'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                      'a', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                      'hr', 'span', 'div'],
+      ALLOWED_ATTR: ['href', 'src', 'alt', 'class', 'id', 'target'],
+    });
   }, [content]);
 
   useEffect(() => {

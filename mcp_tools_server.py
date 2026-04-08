@@ -126,12 +126,31 @@ def run_ssh_command(host: str, command: str, user: str = "root") -> str:
 @mcp.tool()
 def write_file(path: str, content: str) -> str:
     """Записывает содержимое в файл.
-    
+
     Требует подтверждения пользователя перед выполнением.
     Создаёт родительские директории если они не существуют.
     """
     try:
-        file_path = Path(path)
+        # Валидация пути - предотвращение path traversal
+        file_path = Path(path).resolve()
+
+        # Разрешаем запись только в безопасные директории
+        allowed_roots = [
+            Path.cwd(),  # Текущая директория проекта
+            Path.home() / "projects",  # Директория проектов
+            Path.home() / "workspace",  # Рабочая директория
+            Path("/tmp"),  # Временные файлы
+        ]
+
+        is_safe = any(
+            file_path.is_relative_to(root)
+            for root in allowed_roots
+            if root.exists()
+        )
+
+        if not is_safe:
+            return f"Error: путь {path} вне разрешённых директорий"
+
         # Создаём родительские директории
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
@@ -143,19 +162,37 @@ def write_file(path: str, content: str) -> str:
 @mcp.tool()
 def edit_file(path: str, old_string: str, new_string: str) -> str:
     """Редактирует файл, заменяя old_string на new_string.
-    
+
     Требует подтверждения пользователя перед выполнением.
     Заменяет только первое вхождение old_string.
     """
     try:
-        file_path = Path(path)
+        # Валидация пути - предотвращение path traversal
+        file_path = Path(path).resolve()
+
+        # Разрешаем редактирование только в безопасных директориях
+        allowed_roots = [
+            Path.cwd(),
+            Path.home() / "projects",
+            Path.home() / "workspace",
+        ]
+
+        is_safe = any(
+            file_path.is_relative_to(root)
+            for root in allowed_roots
+            if root.exists()
+        )
+
+        if not is_safe:
+            return f"Error: путь {path} вне разрешённых директорий"
+
         if not file_path.exists():
             return f"Error: файл не найден: {path}"
-        
+
         content = file_path.read_text(encoding="utf-8")
         if old_string not in content:
             return f"Error: '{old_string[:50]}...' не найдено в файле"
-        
+
         new_content = content.replace(old_string, new_string, 1)
         file_path.write_text(new_content, encoding="utf-8")
         return f"Файл обновлён: {path} (заменено 1 вхождение)"

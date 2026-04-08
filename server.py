@@ -43,9 +43,6 @@ from mcp.client.stdio import stdio_client
 
 # ─── Конфигурация ───────────────────────────────────────────────
 
-import logging
-import sys
-
 # Настройка логирования ДО всех импортов которые используют logger
 log_handler = logging.FileHandler(Path(__file__).parent / "server.log")
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -454,13 +451,38 @@ async def get_mcp_tools() -> list:
 
 # ─── Qwen CLI SDK mode ──────────────────────────────────────────
 
+def get_qwen_path() -> str:
+    """Получает путь к qwen CLI.
+
+    Порядок поиска:
+    1. Переменная окружения QWEN_PATH
+    2. which('qwen') - ищет в PATH
+    3. Выбрасывает FileNotFoundError
+    """
+    # Сначала проверяем переменную окружения
+    qwen_path = os.getenv("QWEN_PATH")
+    if qwen_path and Path(qwen_path).exists():
+        return qwen_path
+
+    # Пробуем найти в PATH через shutil.which
+    import shutil  # Import here to avoid top-level import issues
+    qwen_path = shutil.which("qwen")
+    if qwen_path:
+        return qwen_path
+
+    raise FileNotFoundError(
+        "qwen CLI не найден. Установите qwen или укажите путь через "
+        "переменную окружения QWEN_PATH (например: export QWEN_PATH=/path/to/qwen)"
+    )
+
+
 def run_qwen_cli_sdk(session_id: str = None, resume_id: str = None):
     """
     Запускает qwen cli в SDK mode.
     --session-id для первого сообщения (создаёт сессию).
     --resume <uuid> для последующих (загружает историю).
     """
-    qwen_path = os.getenv("QWEN_PATH", "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen")
+    qwen_path = get_qwen_path()
     cmd = [
         qwen_path,
         "--input-format", "stream-json",
