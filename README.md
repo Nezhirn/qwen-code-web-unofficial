@@ -97,7 +97,7 @@
 ### 1. Клонирование репозитория
 ```bash
 git clone <repository-url>
-cd qwen-code-web-unofficial_prod
+cd qwen-code-web-unofficial
 ```
 
 ### 2. Установка зависимостей backend
