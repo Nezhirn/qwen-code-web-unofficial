@@ -40,8 +40,16 @@ from fastapi.staticfiles import StaticFiles
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 
 # ─── Конфигурация ───────────────────────────────────────────────
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 # Настройка логирования ДО всех импортов которые используют logger
 log_handler = logging.FileHandler(Path(__file__).parent / "server.log")
@@ -62,6 +70,10 @@ MCP_SERVER_SCRIPT = str(Path(__file__).parent / "mcp_tools_server.py")
 
 # Хранилище фоновых задач
 background_tasks: dict = {}
+
+# Блокировка сессий для предотвращения race conditions
+# Предотвращает параллельную обработку нескольких сообщений в одной сессии
+active_sessions: dict = {}  # session_id -> asyncio.Event
 
 # Инструменты требующие подтверждения
 TOOLS_REQUIRING_CONFIRMATION = {
@@ -183,7 +195,7 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-def get_sessions(user_id: Optional[str] = None):
+def get_sessions(user_id: Optional[str] = None) -> list[dict]:
     conn = get_db()
     conn.row_factory = sqlite3.Row
     if user_id:
@@ -197,7 +209,7 @@ def get_sessions(user_id: Optional[str] = None):
     return [dict(r) for r in rows]
 
 
-def create_session(title="Новый чат", user_id: Optional[str] = None):
+def create_session(title: str = "Новый чат", user_id: Optional[str] = None) -> dict:
     sid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = get_db()
@@ -210,14 +222,14 @@ def create_session(title="Новый чат", user_id: Optional[str] = None):
     return {"id": sid, "title": title, "created_at": now, "updated_at": now, "user_id": user_id}
 
 
-def rename_session(sid: str, title: str):
+def rename_session(sid: str, title: str) -> None:
     conn = get_db()
     conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
     conn.commit()
     conn.close()
 
 
-def delete_session(sid: str):
+def delete_session(sid: str) -> None:
     conn = get_db()
     conn.execute("DELETE FROM memory WHERE session_id = ?", (sid,))
     conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
@@ -226,7 +238,7 @@ def delete_session(sid: str):
     conn.close()
 
 
-def get_messages(session_id: str):
+def get_messages(session_id: str) -> list[dict]:
     conn = get_db()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -237,7 +249,7 @@ def get_messages(session_id: str):
     return [dict(r) for r in rows]
 
 
-def save_message(session_id, role, content, thinking=None, tool_calls=None, tool_name=None):
+def save_message(session_id: str, role: str, content: str, thinking: Optional[str] = None, tool_calls: Optional[list] = None, tool_name: Optional[str] = None) -> None:
     now = datetime.now().isoformat()
     conn = get_db()
     conn.execute(
@@ -259,7 +271,7 @@ def get_session_prompt(session_id: str) -> Optional[str]:
     return row[0] if row and row[0] else None
 
 
-def set_session_prompt(session_id: str, prompt: Optional[str]):
+def set_session_prompt(session_id: str, prompt: Optional[str]) -> None:
     conn = get_db()
     conn.execute(
         "UPDATE sessions SET system_prompt = ? WHERE id = ?",
@@ -269,7 +281,7 @@ def set_session_prompt(session_id: str, prompt: Optional[str]):
     conn.close()
 
 
-def read_memory_for_session(session_id: str) -> list:
+def read_memory_for_session(session_id: str) -> list[dict]:
     conn = get_db()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -280,7 +292,7 @@ def read_memory_for_session(session_id: str) -> list:
     return [{"key": r["key"], "value": r["value"]} for r in rows]
 
 
-def save_memory_for_session(session_id: str, key: str, value: str):
+def save_memory_for_session(session_id: str, key: str, value: str) -> None:
     now = datetime.now().isoformat()
     conn = get_db()
     conn.execute(
@@ -293,7 +305,7 @@ def save_memory_for_session(session_id: str, key: str, value: str):
     conn.close()
 
 
-def auto_title(session_id: str, user_msg: str):
+def auto_title(session_id: str, user_msg: str) -> Optional[str]:
     title = user_msg[:50].strip()
     if len(user_msg) > 50:
         title += "..."
@@ -619,7 +631,10 @@ def build_history(messages: list, session_id: str = "", custom_prompt: str = Non
         elif m["role"] == "tool":
             all_msgs.append({"role": "tool", "content": m["content"]})
         elif m["role"] == "assistant_tool_call":
-            tc = json.loads(m["tool_calls"]) if m["tool_calls"] else []
+            try:
+                tc = json.loads(m["tool_calls"]) if m["tool_calls"] else []
+            except (json.JSONDecodeError, TypeError):
+                tc = []
             entry = {"role": "assistant", "content": m["content"] or ""}
             if tc:
                 entry["tool_calls"] = tc
@@ -836,7 +851,10 @@ async def stream_chat_background(
                     proc.stdin.write(msg_data + "\n")
                     proc.stdin.flush()
                 elif msg["role"] == "assistant_tool_call":
-                    tool_calls = json.loads(msg["tool_calls"]) if msg["tool_calls"] else []
+                    try:
+                        tool_calls = json.loads(msg["tool_calls"]) if msg["tool_calls"] else []
+                    except (json.JSONDecodeError, TypeError):
+                        tool_calls = []
                     content_parts = []
                     if msg["content"]:
                         content_parts.append({"type": "text", "text": msg["content"]})
@@ -1322,10 +1340,35 @@ async def _process_line(
 async def lifespan(app: FastAPI):
     init_db()
     yield
-    # Shutdown: закрываем MCP сессию
+    # Graceful Shutdown: корректно завершаем все активные задачи
+    logger.info("Graceful shutdown started...")
+
+    # 1. Закрываем MCP сессию
     await mcp_manager.close()
 
+    # 2. Останавливаем все активные background_tasks
+    for sid, task_info in list(background_tasks.items()):
+        logger.info(f"Stopping task for session {sid}")
+        task_info["stop_event"].set()
+        try:
+            await asyncio.wait_for(task_info["task"], timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            task_info["task"].cancel()
+            try:
+                await task_info["task"]
+            except Exception:
+                pass
+        finally:
+            if sid in background_tasks:
+                del background_tasks[sid]
+
+    # 3. Даём время на завершение
+    await asyncio.sleep(0.5)
+    logger.info("Graceful shutdown completed")
+
 app = FastAPI(title="Qwen Agent", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1378,11 +1421,13 @@ async def health_check():
 
 
 @app.get("/api/sessions")
+@limiter.limit("30/minute")
 async def api_sessions():
     return get_sessions()
 
 
 @app.post("/api/sessions")
+@limiter.limit("10/minute")
 async def api_create_session(request: Request):
     try:
         body = await request.json()
@@ -1393,6 +1438,7 @@ async def api_create_session(request: Request):
 
 
 @app.delete("/api/sessions/{sid}")
+@limiter.limit("20/minute")
 async def api_delete_session(sid: str):
     # Остановить активную задачу если есть
     if sid in background_tasks:
@@ -1489,7 +1535,10 @@ async def api_export_session(sid: str):
         role = msg['role']
         content = msg['content'] or ""
         thinking = msg['thinking'] or ""
-        tool_calls = json.loads(msg['tool_calls']) if msg['tool_calls'] else None
+        try:
+            tool_calls = json.loads(msg['tool_calls']) if msg['tool_calls'] else None
+        except (json.JSONDecodeError, TypeError):
+            tool_calls = None
         tool_name = msg['tool_name']
 
         if role == "user":
@@ -1610,8 +1659,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 # Reader завершил работу — соединение закрыто
                 break
             if item.get("type") == "message":
+                # Проверка на race condition: если сессия уже обрабатывается - пропускаем
+                if session_id in active_sessions:
+                    logger.warning(f"Сессия {session_id} уже обрабатывается, пропускаем новое сообщение")
+                    await _safe_send(ws, {
+                        "type": "error",
+                        "content": "Предыдущее сообщение ещё обрабатывается. Подождите завершения."
+                    })
+                    continue
+
                 logger.info(f"Обработка сообщения для сессии {session_id}: {item['content'][:50]}...")
                 stop_event.clear()
+
+                # Блокируем сессию
+                active_sessions[session_id] = True
 
                 confirm_queue = asyncio.Queue()
                 task_stop_event = asyncio.Event()
@@ -1657,6 +1718,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 finally:
                     if session_id in background_tasks and background_tasks[session_id]["task"] == background_task:
                         del background_tasks[session_id]
+                    # Разблокируем сессию
+                    if session_id in active_sessions:
+                        del active_sessions[session_id]
     except asyncio.CancelledError:
         # Нормальное завершение при shutdown - отменяем все задачи
         if session_id in background_tasks:
@@ -1672,6 +1736,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
             finally:
                 if session_id in background_tasks:
                     del background_tasks[session_id]
+            # Разблокируем сессию
+            if session_id in active_sessions:
+                del active_sessions[session_id]
     except Exception as e:
         logger.error(f"WebSocket ошибка: {e}", exc_info=True)
     finally:
@@ -1695,6 +1762,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
             finally:
                 if session_id in background_tasks:
                     del background_tasks[session_id]
+            # Разблокируем сессию
+            if session_id in active_sessions:
+                del active_sessions[session_id]
         logger.info(f"WebSocket сессия завершена: {session_id}")
 
 
